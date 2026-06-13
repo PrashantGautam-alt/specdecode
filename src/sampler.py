@@ -78,7 +78,40 @@ def naive_generate(model, tokenizer, prompt: str, max_new_tokens: int = 50, temp
     return text
 
 
+def speculative_sample_one_step(p: torch.Tensor, q: torch.Tensor, draft_token: int) -> int:
+    """
+    Runs one step of speculative decoding rejection sampling.
 
+    Given draft model distribution q and target model distribution p,
+    either accepts the draft token or samples a correction token.
+
+    Args:
+        p: target model probability distribution, shape [vocab_size]
+        q: draft model probability distribution, shape [vocab_size]
+        draft_token: the token id sampled by the draft model
+
+    Returns:
+        accepted token id (int)
+    """
+    # 1. Compute acceptance probability for the draft token.
+    #    Formula: min(1, p[draft_token] / q[draft_token])
+    acceptance_prob = min(1, p[draft_token]/q[draft_token])
+
+    # 2. Draw a random number between 0 and 1.
+    #    torch.rand(1).item() gives a single float.
+    r = torch.rand(1).item()
+
+    # 3. If r < acceptance_prob, accept the draft token.
+    if r < acceptance_prob:
+        return draft_token
+
+    # 4. Otherwise, sample from the corrected distribution.
+    #    Step a: compute max(0, p - q) elementwise
+    #    Step b: normalize so it sums to 1
+    #    Step c: sample one token using torch.multinomial
+    corrected = torch.clamp(p - q, min=0)
+    corrected = corrected / corrected.sum()
+    return torch.multinomial(corrected, num_samples=1).item()
 
 
 
