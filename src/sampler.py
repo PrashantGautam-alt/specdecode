@@ -26,6 +26,8 @@ def naive_generate(model, tokenizer, prompt: str, max_new_tokens: int = 50, temp
 
     past_key_values = None  # cache starts empty
 
+    generated_ids = []
+
     with torch.no_grad():
         for _ in range(max_new_tokens):
 
@@ -65,7 +67,7 @@ def naive_generate(model, tokenizer, prompt: str, max_new_tokens: int = 50, temp
             #    Slice input_ids to just the last token.
             input_ids = input_ids[:,-1:]
 
-            generated_ids = []
+            
             generated_ids.append(next_token_id.item())
 
     # 10. Decode the full token sequence back to text.
