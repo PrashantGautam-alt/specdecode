@@ -11,7 +11,7 @@ def measure_tokens_per_sec(model, tokenizer, prompt: str, max_new_tokens: int = 
     Multiple runs average out GPU warm-up variance.
     """
 
-    timer = []
+    times = []
 
     for _ in range(runs):
         torch.cuda.synchronize() # wait for GPU to finish any pending work
@@ -23,7 +23,7 @@ def measure_tokens_per_sec(model, tokenizer, prompt: str, max_new_tokens: int = 
         end = time.perf_counter()
 
 
-        time.append(max_new_tokens/(end-start))
+        times.append(max_new_tokens/(end-start))
 
 
     return sum(times)/len(times)
