@@ -119,7 +119,7 @@ def _trim_kv_cache(past_key_values, keep_length):
     for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
         trimmed.key_cache.append(k[:, :, :keep_length, :])
         trimmed.value_cache.append(v[:, :, :keep_length, :])
-    return trimmedgit add src/sampler.py
+    return trimmed
 
 def speculative_decode(
     draft_model,
