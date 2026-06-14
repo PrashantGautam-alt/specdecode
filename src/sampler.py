@@ -115,11 +115,8 @@ def speculative_sample_one_step(p: torch.Tensor, q: torch.Tensor, draft_token: i
     return torch.multinomial(corrected, num_samples=1).item()
 
 def _trim_kv_cache(past_key_values, keep_length):
-    trimmed = DynamicCache()
-    for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
-        trimmed.key_cache.append(k[:, :, :keep_length, :])
-        trimmed.value_cache.append(v[:, :, :keep_length, :])
-    return trimmed
+    past_key_values.crop(keep_length)
+    return past_key_values
 
 def speculative_decode(
     draft_model,
