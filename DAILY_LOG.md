@@ -2,7 +2,7 @@
 
 **Project start date:** 2026-06-06  
 **Target end date:** 2026-06-28 (18 days core — extended roadmap with Adaptive K)  
-**Current day:** DAY 1 COMPLETE (2026-06-13). Next up: Day 2 — write the naive generation loop by hand in `src/sampler.py`
+**Current day:** DAY 5 COMPLETE (2026-06-14). SpecDecode beats naive — **1.17x at K=4** (instruct draft). Next up: Day 6 — Medusa heads.
 
 ---
 
@@ -215,25 +215,47 @@ PASSED
 ### Day 5 — Tuning K and Debugging
 **Goal:** Find the optimal K. Fix any bugs caught during the K sweep.
 
-**Status:** NOT STARTED
+**Status:** DONE (completed 2026-06-14)
 
 **Deliverable:**
-- [ ] K sweep data recorded: K ∈ {1, 2, 4, 6, 8} vs tokens/sec and acceptance rate
-- [ ] `sampler.py` cleaned up, no debug prints
-- [ ] Peak speedup number identified and written down
+- [x] K sweep data recorded: K ∈ {1, 2, 4, 6, 8} vs tokens/sec and acceptance rate
+- [~] `sampler.py` cleaned up — one print KEPT on purpose (the `avg tokens/round` acceptance counter; it's instrumentation, not debug noise). Remove before final report.
+- [x] Peak speedup number identified: **1.17x at K=4** (instruct draft)
+
+**K Sweep Results (Naive 8B baseline: 38.0 tok/s):**
+
+Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 runs/K.
+
+| K | tok/s | speedup | avg tokens/round (acceptance) |
+|---|---|---|---|
+| 1 | 27.8 | 0.73x | 1.00 |
+| 2 | 38.4 | 1.01x | 1.83 |
+| **4** | **44.4** | **1.17x** | **3.05** |
+| 6 | 39.0 | 1.03x | 3.65 |
+| 8 | 34.0 | 0.89x | 3.82 |
+
+(Earlier sweep with the BASE draft `Llama-3.2-1B` peaked at only 0.97x — see "what I learned".)
 
 **What I learned today:**
-*(fill in)*
+- **Removed the bonus token.** It forced 2 extra forward passes (draft + target) on every fully-accepted round to refresh the caches/lookahead. Cost more than the free token was worth. Deleted it; M now ranges 1..K only.
+- **Built an acceptance counter.** Added `rounds` + print of `avg tokens/round = len(generated_ids) / rounds`. Key insight: `len(generated_ids)` is ALREADY the running sum of M (each round does `extend(accepted)` which adds M tokens), so no separate total needed.
+- **Derived a cost model that fits every data point:** `speedup ≈ acceptance / (0.40 × K + 1)`. Each draft pass costs ~40% of a target pass; +1 is the single verify pass.
+  - Predicted K=4: 3.05 / 2.6 = 1.17x — matched the measured 1.17x exactly.
+- **The cross-GPU overhead was NOT the problem.** The model had no leftover constant term → o ≈ 0. Moving both models to one GPU would buy almost nothing. (My earlier hypothesis; the data refuted it.)
+- **The draft was the real tax — 40% of target, not the 15% its size suggests.** Single-token forward passes are dominated by fixed per-call overhead, and we run K of them serially.
+- **Base-vs-Instruct mismatch was capping acceptance.** Draft was the BASE 1B, target was INSTRUCT 8B → different "dialects" (base continues raw text, instruct answers like an assistant). Switching draft to `Llama-3.2-1B-Instruct` raised acceptance ~+0.6 at K=4 (2.45 → 3.05) at the SAME draft cost — that's what crossed us over 1.0x.
+- **Why K=4 is the peak:** cost grows linear and GUARANTEED (+0.40 per draft token, accepted or not); acceptance grows sub-linear and CONDITIONAL (the first wrong guess wastes every later draft pass that round). Past K=4 the cost outruns the diminishing acceptance gains.
 
 **Blockers / Questions:**
-*(fill in)*
+- None. GPUs were free this session (Ollama gone). Draft on cuda:0, target on cuda:1.
+- Note: the lone `print` in `speculative_decode` should be made optional/removed before the final report (Day 13 cleanup).
 
-**Starting Point for Next Session (Day 5):**
-1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`
-2. Write `scripts/k_sweep.py` — loops over K ∈ {1, 2, 4, 6, 8}, records tok/s and speedup for each
-3. Run the sweep and record all numbers in this log
-4. Identify peak K and explain why that K wins
-5. Key question to answer: why does 1.04x feel low? Is it acceptance rate or overhead?
+**Starting Point for Next Session (Day 6 — Medusa):**
+1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`, `git pull origin main`
+2. Headline to remember: **SpecDecode beats naive — 1.17x at K=4** with the instruct draft. The 0.40-per-draft-token cost model explains the whole K curve.
+3. Goal: begin Medusa. READ FIRST before any code — what a Medusa head is and WHY it can be cheaper than a separate draft model (no second model to run K times → attacks that 0.40 draft tax directly).
+4. New concepts queued: Medusa head (small MLP on top of the base model's last hidden state), SiLU activation, why multiple heads predict multiple future positions at once.
+5. Connect it back: Medusa's whole appeal is killing the `0.40 × K` term — the heads ride the target's own forward pass instead of running a separate draft model serially.
 
 ---
 
@@ -342,11 +364,11 @@ PASSED
 | Metric | Value | Date measured |
 |---|---|---|
 | Baseline (1B naive) tok/s | 83.3 | 2026-06-13 |
-| Baseline (8B naive) tok/s | 37.9 | 2026-06-14 |
-| SpecDecode-Small tok/s | 39.4 | 2026-06-14 |
-| SpecDecode-Small speedup | 1.04x (K=4) | 2026-06-14 |
-| Best acceptance rate | | |
-| Best K value | | |
+| Baseline (8B naive) tok/s | 38.0 | 2026-06-14 |
+| SpecDecode-Small tok/s | 44.4 (K=4, instruct draft) | 2026-06-14 |
+| SpecDecode-Small speedup | 1.17x (K=4, instruct draft) | 2026-06-14 |
+| Best acceptance rate | 3.05 tokens/round (K=4) | 2026-06-14 |
+| Best K value | 4 | 2026-06-14 |
 | Medusa tok/s | | |
 | Medusa speedup | | |
 
