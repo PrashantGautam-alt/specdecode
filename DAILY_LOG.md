@@ -386,5 +386,9 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 - [x] The rejection sampling proof: why min(1, p/q) gives us p *(verified 2026-06-13, 100K test passed)*
 - [x] Why verification can be done in parallel but generation cannot *(verified 2026-06-14)*
 - [x] The 4 phases of speculative decoding *(verified 2026-06-14)*
+- [x] The cost model: why speedup ≈ acceptance / (0.40 × K + 1) *(verified 2026-06-14)*
+- [x] Why acceptance rate (avg tokens/round) is THE metric that decides the speedup *(verified 2026-06-14)*
+- [x] Why matching draft/target training style (base vs instruct) raises acceptance *(verified 2026-06-14)*
+- [x] Why an optimal K exists and why going past it hurts (linear certain cost vs diminishing conditional acceptance) *(verified 2026-06-14)*
 - [ ] What a Medusa head is and how it differs from a separate draft model
 - [ ] Why FastAPI + WebSockets for streaming (not HTTP)
