@@ -114,6 +114,12 @@ def speculative_sample_one_step(p: torch.Tensor, q: torch.Tensor, draft_token: i
     corrected = corrected / corrected.sum()
     return torch.multinomial(corrected, num_samples=1).item()
 
+def _trim_kv_cache(past_key_values, keep_length):
+    return tuple(
+        (k[:, :, :keep_length, :], v[:, :, :keep_length, :])
+        for k, v in past_key_values
+    )
+
 def speculative_decode(
     draft_model,
     target_model,
@@ -144,87 +150,120 @@ def speculative_decode(
     Returns:
         generated text as string
     """
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(draft_model.device)
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(draft_model.device)
     generated_ids = []
-
-    draft_past = None
-    target_past = None
+    current_len = prompt_ids.shape[1]
 
     with torch.no_grad():
+
+        draft_prime = draft_model(prompt_ids, past_key_values=None, use_cache=True)
+        draft_past = draft_prime.past_key_values
+        draft_next_logit = draft_prime.logits[0, -1, :]
+
+        target_prime = target_model(prompt_ids.to(target_model.device), past_key_values=None, use_cache=True)
+        target_past = target_prime.past_key_values
+        target_lookahead = target_prime.logits[0, -1, :]
+
         while len(generated_ids) < max_new_tokens:
 
             # ── PHASE 1: DRAFT ──────────────────────────────────────────
             # Run draft model K steps autoregressively.
             # Save each token id and its probability distribution.
             draft_tokens = []
-            draft_probs = []
-            draft_input = input_ids
+            draft_qs = []
+            draft_logit_at = [draft_next_logit]
 
-            for _ in range(K):
-                draft_out = draft_model(draft_input, past_key_values=draft_past, use_cache=True)
-                draft_past = draft_out.past_key_values
-
-                logits = draft_out.logits[0, -1, :]
+            for step in range(K):
+                logit = draft_logit_at[step]
                 if temperature != 1.0:
-                    logits = logits / temperature
-                q = F.softmax(logits, dim=-1)
-
+                    logit = logit / temperature
+                q = F.softmax(logit, dim=-1)
                 token = torch.multinomial(q, num_samples=1).item()
-                draft_tokens.append(token)
-                draft_probs.append(q)
 
-                draft_input = torch.tensor([[token]], device=draft_model.device)
+                draft_tokens.append(token)
+                draft_qs.append(q)
+
+                out = draft_model(
+                    torch.tensor([[token]], device=draft_model.device),
+                    past_key_values=draft_past,
+                    use_cache=True
+                )
+                draft_past = out.past_key_values
+                draft_logit_at.append(out.logits[0, -1, :])
 
             # ── PHASE 2: TARGET ─────────────────────────────────────────
             # Run target model ONCE on (context + all K draft tokens).
             # This gives K+1 distributions in one forward pass.
             draft_tensor = torch.tensor([draft_tokens], device=target_model.device)
-            target_input = torch.cat([input_ids.to(target_model.device), draft_tensor], dim=-1)
 
-            target_out = target_model(target_input, past_key_values=target_past, use_cache=True)
+            target_out = target_model(draft_tensor, past_key_values=target_past, use_cache=True)
+
             target_past = target_out.past_key_values
 
-            target_logits = target_out.logits[0]  # shape [seq_len, vocab_size]
+            target_k_logits = target_out.logits[0]  # shape [K, vocab_size]
 
             # ── PHASE 3: ACCEPT ─────────────────────────────────────────
             # For each draft token, run rejection sampling.
             # Stop at first rejection.
             accepted = []
+            M = 0
             all_accepted = True
-            n = input_ids.shape[1]  # length of current context
 
-            for i, (token, q) in enumerate(zip(draft_tokens, draft_probs)):
-                logits_i = target_logits[n - 1 + i]
-                if temperature != 1.0:
-                    logits_i = logits_i / temperature
-                p = F.softmax(logits_i, dim=-1).to(q.device)
+            tl = target_lookahead / temperature if temperature != 1.0 else target_lookahead
+            p0 = F.softmax(tl, dim=-1).to(draft_model.device)
+            a0 = speculative_sample_one_step(p0, draft_qs[0], draft_tokens[0])
+            accepted.append(a0)
+            M = 1
 
-                accepted_token = speculative_sample_one_step(p, q, token)
-                accepted.append(accepted_token)
-
-                if accepted_token != token:
-                    all_accepted = False
-                    break
+            if a0 != draft_tokens[0]:
+                all_accepted = False
+            else:
+                for i in range(1, K):
+                    logit_i = target_k_logits[i - 1]
+                    if temperature != 1.0:
+                        logit_i = logit_i / temperature
+                    p_i = F.softmax(logit_i, dim=-1).to(draft_model.device)
+                    a_i = speculative_sample_one_step(p_i, draft_qs[i], draft_tokens[i])
+                    accepted.append(a_i)
+                    M += 1
+                    if a_i != draft_tokens[i]:
+                        all_accepted = False
+                        break
 
             # ── PHASE 4: BONUS ──────────────────────────────────────────
-            # If all K draft tokens were accepted, sample one free token
-            # from the target distribution at position K.
             if all_accepted:
-                bonus_logits = target_logits[n - 1 + K]
+                bonus_logit = target_k_logits[K - 1]
                 if temperature != 1.0:
-                    bonus_logits = bonus_logits / temperature
-                bonus_p = F.softmax(bonus_logits, dim=-1)
-                bonus_token = torch.multinomial(bonus_p, num_samples=1).item()
-                accepted.append(bonus_token)
+                    bonus_logit = bonus_logit / temperature
+                bonus = torch.multinomial(F.softmax(bonus_logit, dim=-1), num_samples=1).item()
+                accepted.append(bonus)
+                M += 1
 
-            # Update context and generated list
+            # ── UPDATE STATE ─────────────────────────────────────────────
             generated_ids.extend(accepted)
-            new_tokens = torch.tensor([accepted], device=input_ids.device)
-            input_ids = torch.cat([input_ids, new_tokens], dim=-1)
+            current_len += M
 
-            # Reset caches — context has changed, caches are now stale
-            draft_past = None
-            target_past = None
+            if M <= K:
+                draft_past = _trim_kv_cache(draft_past, current_len)
+                target_past = _trim_kv_cache(target_past, current_len)
+                draft_next_logit = draft_logit_at[M]
+                target_lookahead = target_k_logits[M - 1]
+            else:
+                b = accepted[-1]
+                d_out = draft_model(
+                    torch.tensor([[b]], device=draft_model.device),
+                    past_key_values=draft_past,
+                    use_cache=True
+                )
+                draft_past = d_out.past_key_values
+                draft_next_logit = d_out.logits[0, -1, :]
+
+                t_out = target_model(
+                    torch.tensor([[b]], device=target_model.device),
+                    past_key_values=target_past,
+                    use_cache=True
+                )
+                target_past = t_out.past_key_values
+                target_lookahead = t_out.logits[0, -1, :]
 
     return tokenizer.decode(generated_ids[:max_new_tokens], skip_special_tokens=True)
-
