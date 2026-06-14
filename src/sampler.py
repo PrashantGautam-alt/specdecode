@@ -134,7 +134,7 @@ def speculative_decode(
       1. DRAFT:  run draft model K steps, collect token ids and distributions q
       2. TARGET: run target model once on (context + K draft tokens), get K+1 distributions p
       3. ACCEPT: rejection sample each draft token, stop at first rejection
-      4. BONUS:  if all K accepted, sample one free token from p[K]
+      4. UPDATE: trim caches to accepted length, set lookahead logits for next iteration
 
     Args:
         draft_model: small fast model (Llama 3.2 1B)
@@ -205,7 +205,6 @@ def speculative_decode(
             # Stop at first rejection.
             accepted = []
             M = 0
-            all_accepted = True
 
             tl = target_lookahead / temperature if temperature != 1.0 else target_lookahead
             p0 = F.softmax(tl, dim=-1).to(draft_model.device)
@@ -213,9 +212,7 @@ def speculative_decode(
             accepted.append(a0)
             M = 1
 
-            if a0 != draft_tokens[0]:
-                all_accepted = False
-            else:
+            if a0 == draft_tokens[0]:
                 for i in range(1, K):
                     logit_i = target_k_logits[i - 1]
                     if temperature != 1.0:
@@ -225,43 +222,18 @@ def speculative_decode(
                     accepted.append(a_i)
                     M += 1
                     if a_i != draft_tokens[i]:
-                        all_accepted = False
                         break
 
-            # ── PHASE 4: BONUS ──────────────────────────────────────────
-            if all_accepted:
-                bonus_logit = target_k_logits[K - 1]
-                if temperature != 1.0:
-                    bonus_logit = bonus_logit / temperature
-                bonus = torch.multinomial(F.softmax(bonus_logit, dim=-1), num_samples=1).item()
-                accepted.append(bonus)
-                M += 1
 
             # ── UPDATE STATE ─────────────────────────────────────────────
             generated_ids.extend(accepted)
             current_len += M
 
-            if M <= K:
-                draft_past = _trim_kv_cache(draft_past, current_len)
-                target_past = _trim_kv_cache(target_past, current_len)
-                draft_next_logit = draft_logit_at[M]
-                target_lookahead = target_k_logits[M - 1]
-            else:
-                b = accepted[-1]
-                d_out = draft_model(
-                    torch.tensor([[b]], device=draft_model.device),
-                    past_key_values=draft_past,
-                    use_cache=True
-                )
-                draft_past = d_out.past_key_values
-                draft_next_logit = d_out.logits[0, -1, :]
 
-                t_out = target_model(
-                    torch.tensor([[b]], device=target_model.device),
-                    past_key_values=target_past,
-                    use_cache=True
-                )
-                target_past = t_out.past_key_values
-                target_lookahead = t_out.logits[0, -1, :]
+            draft_past = _trim_kv_cache(draft_past, current_len)
+            target_past = _trim_kv_cache(target_past, current_len)
+            draft_next_logit = draft_logit_at[M]
+            target_lookahead = target_k_logits[M - 1]
+            
 
     return tokenizer.decode(generated_ids[:max_new_tokens], skip_special_tokens=True)
