@@ -1,0 +1,91 @@
+DAY 4 — GPU FIX NOTES
+=====================
+Date: 2026-06-14
+Problem: CUDA OutOfMemoryError when loading both models
+
+
+THE PROBLEM
+-----------
+We have two GPUs on passpoli:
+  GPU 0 (cuda:0) — 24 GB
+  GPU 1 (cuda:1) — 24 GB
+
+In Python/PyTorch, the word "cuda" without a number always means cuda:0.
+ModelLoader was using device="cuda" for every model it loaded.
+So both the 1B draft model AND the 8B target model tried to load onto GPU 0.
+
+  1B model  = ~2 GB
+  8B model  = ~16 GB
+  Ollama    = ~10.75 GB (already on GPU 0, another process)
+  Total     = ~28.75 GB → crash. GPU 0 only has 24 GB.
+
+PyTorch does NOT fall back to GPU 1 or CPU automatically.
+It simply crashes with: torch.OutOfMemoryError
+
+
+THE FIX — 3 FILES CHANGED
+--------------------------
+
+1. src/models.py
+   WHAT: Added a 'device' parameter to ModelLoader.__init__()
+   WHY:  Before, every ModelLoader always used cuda:0. Now the caller
+         can say which GPU to use. Default is cuda:0 so old code still works.
+   ALSO: Changed torch_dtype= to dtype= (torch_dtype is deprecated in
+         the new version of the transformers library)
+
+2. scripts/compare_speed.py
+   WHAT: Passed device="cuda:0" to draft loader, device="cuda:1" to target loader
+   WHY:  This is where we actually split the models across GPUs.
+         1B (draft) → cuda:0 alongside Ollama (13.5 GB free, fits easily)
+         8B (target) → cuda:1 (24 GB free, fits with room to spare)
+
+3. src/sampler.py
+   WHAT: Replaced every hardcoded device="cuda" with model-aware references
+   WHY:  Once draft and target live on different GPUs, any tensor you create
+         must go to the RIGHT GPU before being fed to a model.
+         Feeding a tensor on cuda:0 to a model on cuda:1 crashes immediately.
+
+   Six specific changes inside sampler.py:
+
+   a) naive_generate — input_ids
+      .to("cuda")  →  .to(model.device)
+      WHY: naive_generate can be called with any model on any GPU.
+           Ask the model where it lives instead of assuming cuda:0.
+
+   b) speculative_decode — input_ids (prompt tokens)
+      .to("cuda")  →  .to(draft_model.device)
+      WHY: The draft model runs first, so put the initial tokens on its GPU.
+
+   c) speculative_decode — draft_input (single token fed to draft each step)
+      device="cuda"  →  device=draft_model.device
+      WHY: This tensor goes into the draft model, so it must be on cuda:0.
+
+   d) speculative_decode — draft_tensor + target_input (K tokens sent to target)
+      device="cuda"  →  device=target_model.device
+      input_ids.to(target_model.device) added before the cat
+      WHY: The target model is on cuda:1. Both tensors being concatenated
+           must be on the same device before torch.cat will work.
+
+   e) speculative_decode — p (target probability distribution)
+      p = F.softmax(logits_i, dim=-1)
+      →  p = F.softmax(logits_i, dim=-1).to(q.device)
+      WHY: p comes from the target model (cuda:1).
+           q comes from the draft model (cuda:0).
+           speculative_sample_one_step computes p/q — you cannot divide
+           tensors that live on different GPUs. Move p to match q.
+
+   f) speculative_decode — new_tokens (accepted tokens appended to context)
+      device="cuda"  →  device=input_ids.device
+      WHY: input_ids lives on cuda:0. The new tokens being concatenated
+           onto it must be on the same device.
+
+
+KEY MENTAL MODEL
+----------------
+Every tensor in PyTorch has a home GPU.
+Two tensors on different GPUs cannot interact (no math, no cat, no indexing).
+When models live on different GPUs, YOU are responsible for moving tensors
+to the right home before each operation.
+
+model.device  →  tells you where a model lives
+tensor.to(device)  →  moves a tensor to that device (returns a new tensor)

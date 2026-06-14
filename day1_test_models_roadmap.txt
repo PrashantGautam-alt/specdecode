@@ -1,0 +1,221 @@
+================================================================
+DAY 1 FINAL TASK — test_models.py
+Exact roadmap, with the reasoning behind every step
+SpecDecode | Prashant Gautam | 2026-06-12
+================================================================
+
+GOAL
+----
+Prove the entire stack works end-to-end:
+HuggingFace download -> GPU placement -> tokenize text in ->
+model generates 20 tokens -> decode back to text -> measure time.
+
+When this script runs and prints a sentence, Day 1 is DONE.
+
+WHERE
+-----
+Machine:  passpoli (10.119.2.11), via ssh login.ieor.iitb.ac.in -> marol -> passpoli
+Folder:   ~/specdecode
+File:     ~/specdecode/test_models.py   (project root, NOT inside src/)
+Before anything:
+    source ~/specdecode/venv/bin/activate
+    cd ~/specdecode
+
+
+================================================================
+STEP 0 — FIX THE BUG IN src/models.py FIRST
+================================================================
+In load(), inside AutoModelForCausalLM.from_pretrained(...),
+the line:
+
+    torch_dtype = torch.float16   # half precision saves VRAM...
+
+is MISSING A COMMA at the end (before the comment).
+Function arguments are a comma-separated list. Without the comma
+Python reads two arguments mashed together and the whole file
+fails with SyntaxError -- nothing else can work until this is fixed.
+
+Corrected:
+
+    torch_dtype=torch.float16,  # half precision saves VRAM without much quality loss
+    device_map=self.device,
+
+
+================================================================
+STEP 1 — IMPORTS (already done)
+================================================================
+
+    import time
+    from src.models import ModelLoader
+
+WHY:
+- "time" is Python's built-in clock. time.time() returns seconds
+  since 1970. Two readings subtracted = elapsed time. That is our
+  stopwatch for measuring generation speed.
+- "from src.models import ModelLoader": dots = folder path.
+  src/models.py is the module; ModelLoader is the class inside it.
+  Works only when you run from ~/specdecode, because Python looks
+  for the src/ folder relative to where the script lives.
+- You do NOT need AutoTokenizer here. Your ModelLoader.load()
+  already loads the tokenizer and stores it on the object. That
+  was the whole point of writing the class: one clean place that
+  handles loading.
+
+
+================================================================
+STEP 2 — LOAD MODEL + TOKENIZER THROUGH YOUR CLASS
+================================================================
+
+    loader = ModelLoader("meta-llama/Llama-3.2-1B")
+    loader.load()
+
+    model = loader.model
+    tokenizer = loader.tokenizer
+
+WHY:
+- Line 1 creates the object. Your __init__ only RECORDS the name
+  and picks the device ("cuda" because the A5000 is there).
+  Nothing heavy happens yet.
+- Line 2 does the real work: downloads ~2.5 GB of weights
+  (first run only -- cached afterwards), loads them in float16
+  (2 bytes/parameter instead of 4 -> half the VRAM), places them
+  on the GPU, and calls model.eval() (inference mode, dropout off).
+- Lines 3-4: after load(), the model and tokenizer live on the
+  loader as attributes. You reach in and take them.
+
+NOTE: the download uses PASSPOLI's internet (IITB's fast line),
+not your home connection. Your SSH session only carries text.
+
+
+================================================================
+STEP 3 — TOKENIZE THE PROMPT
+================================================================
+
+    prompt = "The capital of France is"
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+WHY:
+- The model never sees text. It sees integer token IDs -- indices
+  into its 128,256-entry vocabulary of word fragments.
+  The tokenizer is the codebook between the two worlds.
+- return_tensors="pt" -> give me a PyTorch tensor, not a plain
+  Python list. The model only eats tensors.
+- .to("cuda") -> move the tensor to the GPU. The model's weights
+  are on the GPU; both operands of any matrix multiply must live
+  on the same device. Forget this and you get:
+  "Expected all tensors to be on the same device".
+- "inputs" is a small dictionary: input_ids (the token IDs) and
+  attention_mask (a helper we will study later -- it marks which
+  positions are real tokens).
+
+
+================================================================
+STEP 4 — GENERATE 20 TOKENS, TIMED
+================================================================
+
+    start_time = time.time()
+    output_ids = model.generate(**inputs, max_new_tokens=20)
+    elapsed = time.time() - start_time
+
+WHY:
+- model.generate() is HuggingFace's built-in autoregressive loop:
+  predict next token, append it, repeat 20 times. TODAY it is a
+  black box. TOMORROW (Day 2) you write this loop yourself --
+  that is the core of the whole project.
+- **inputs unpacks the dictionary into named arguments. It is
+  shorthand for: model.generate(input_ids=..., attention_mask=...).
+- max_new_tokens=20 -> stop after 20 NEW tokens (prompt excluded).
+- The two time.time() calls bracket only the generation, not the
+  model loading. We measure what we care about.
+
+
+================================================================
+STEP 5 — DECODE AND PRINT
+================================================================
+
+    text = tokenizer.decode(output_ids[0])
+    print(text)
+    print(f"Generated 20 tokens in {elapsed:.2f} seconds")
+
+WHY:
+- generate() returns a BATCH: a 2-D grid of token IDs, one row
+  per prompt. We sent one prompt, so we take row 0. That is the
+  [0].
+- decode() = reverse codebook lookup: IDs -> fragments -> glued
+  back into a readable string.
+- The printed text contains your PROMPT PLUS the 20 new tokens.
+  generate() returns the whole sequence, not just the new part.
+- f"..." is an f-string: {elapsed:.2f} substitutes the variable,
+  formatted to 2 decimal places.
+
+
+================================================================
+HOW TO RUN
+================================================================
+
+    cd ~/specdecode
+    source venv/bin/activate      (if not already active)
+    python test_models.py
+
+EXPECTED ON FIRST RUN:
+- "Loading meta-llama/Llama-3.2-1B onto cuda..." (your print)
+- HuggingFace progress bars downloading ~2.5 GB (minutes; one-time)
+- A few seconds of silence while weights move to GPU
+- A sentence starting "The capital of France is ..." -- very
+  likely mentioning Paris
+- The timing line, well under a second of generation time
+
+SECOND RUN: no download, loads from cache in seconds.
+
+
+================================================================
+COMMON ERRORS AND WHAT THEY MEAN
+================================================================
+SyntaxError in models.py
+    -> the missing comma from STEP 0. Fix it.
+
+ModuleNotFoundError: No module named 'src'
+    -> you ran the script from the wrong folder. cd ~/specdecode.
+
+401 / "gated repo" / "access to model ... is restricted"
+    -> HuggingFace login problem. Access was granted 2026-06-10,
+       so if this appears run: hf auth whoami
+       (re-login with: hf auth login)
+
+"Expected all tensors to be on the same device"
+    -> the .to("cuda") in STEP 3 is missing.
+
+NameError: name 'X' is not defined
+    -> typo, or a step used before the step that creates it.
+       Read the line number Python gives you.
+
+
+================================================================
+DAY 1 IS DONE WHEN
+================================================================
+[ ] test_models.py runs without errors
+[ ] You see a sensible completion of the prompt
+[ ] You have a timing number
+[ ] You can explain out loud, without notes:
+      1. What a tokenizer does and why fragments, not words
+         (coverage: fragments compose unseen words;
+          frequency: common words earn whole-token slots,
+          keeping sequences short -- Huffman logic)
+      2. What .to("cuda") does and why it is needed
+      3. Why output_ids[0] -- what the batch dimension is
+      4. What model.generate() did, in one sentence
+         (looped: predict next token, append, repeat -- the loop
+          YOU will write by hand on Day 2)
+
+THEN: update DAILY_LOG.md, mark Day 1 DONE.
+
+ALSO TODAY (5 minutes, do not skip):
+[ ] Request access to the 8B target model on HuggingFace
+    (meta-llama/Llama-3.1-8B-Instruct) -- it is gated separately
+    from the 3.2 collection. Submit now so approval arrives
+    before Day 2 needs it.
+
+NEXT UP (Day 2): write naive_generate() by hand -- no .generate().
+Read before Day 3: Leviathan et al. 2023 (arXiv:2211.17192),
+Abstract + Section 2 + Algorithm 1.
+================================================================
