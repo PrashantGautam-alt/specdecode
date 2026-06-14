@@ -5,17 +5,19 @@ import torch
 from src.models import ModelLoader
 from src.sampler import naive_generate, speculative_decode
 
-def measure(fn, runs =3):
-    times=[]
+def measure(fn, runs=3):
+    times = []
     for _ in range(runs):
-        torch.cuda.synchronize()
+        torch.cuda.synchronize("cuda:0")
+        torch.cuda.synchronize("cuda:1")
         start = time.perf_counter()
         fn()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize("cuda:0")
+        torch.cuda.synchronize("cuda:1")
         end = time.perf_counter()
-        times.append(end-start)
+        times.append(end - start)
 
-    return sum(times)/len(times)
+    return sum(times) / len(times)
 
 MAX_NEW_TOKENS = 100
 PROMPT = "Explain the theory of relativity in simple terms:"
