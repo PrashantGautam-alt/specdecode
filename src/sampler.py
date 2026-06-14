@@ -162,8 +162,10 @@ def speculative_decode(
         target_past = target_prime.past_key_values
         target_lookahead = target_prime.logits[0, -1, :]
 
-        while len(generated_ids) < max_new_tokens:
+        rounds = 0
 
+        while len(generated_ids) < max_new_tokens:
+            rounds +=1
             # ── PHASE 1: DRAFT ──────────────────────────────────────────
             # Run draft model K steps autoregressively.
             # Save each token id and its probability distribution.
@@ -235,5 +237,6 @@ def speculative_decode(
             draft_next_logit = draft_logit_at[M]
             target_lookahead = target_k_logits[M - 1]
             
-
+    avg_tokens_per_round = len(generated_ids) / rounds
+    print(f"K={K} avg tokens/round: {avg_tokens_per_round:.2f}")
     return tokenizer.decode(generated_ids[:max_new_tokens], skip_special_tokens=True)
