@@ -7,7 +7,7 @@ MAX_NEW_TOKENS = 100
 PROMPT = "Explain the theory of relativity in simple terms:"
 
 if __name__ == "__main__":
-    draft_loader = ModelLoader("meta-llama/Llama-3.2-1B", device="cuda:0")
+    draft_loader = ModelLoader("meta-llama/Llama-3.2-1B-Instruct", device="cuda:0")
     draft_loader.load()
 
     target_loader = ModelLoader("meta-llama/Llama-3.1-8B-Instruct", device="cuda:1")
