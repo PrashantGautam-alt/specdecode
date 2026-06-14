@@ -1,4 +1,5 @@
 
+
 import torch
 import torch.nn.functional as F
 
@@ -20,51 +21,98 @@ def naive_generate(model, tokenizer, prompt: str, max_new_tokens: int = 50, temp
     Returns:
         generated text as a string (prompt + new tokens decoded)
     """
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
-    past_key_values = None
+    # 1. Tokenize the prompt. return_tensors="pt" gives a PyTorch tensor.
+    #    Move it to CUDA. Extract just the input_ids tensor.
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+
+    past_key_values = None  # cache starts empty
+
     generated_ids = []
 
     with torch.no_grad():
         for _ in range(max_new_tokens):
+
+            # 2. Run one forward pass.
+            #    Pass input_ids AND past_key_values into model().
+            #    Ask for use_cache=True so HuggingFace returns updated cache.
+            #    The output object has .logits and .past_key_values attributes.
             output = model(input_ids, past_key_values=past_key_values, use_cache=True)
+
+            # 3. Update the cache for the next step.
             past_key_values = output.past_key_values
+
+            # 4. Slice out the logits for the LAST position only.
+            #    Shape should be [128256] after this line.
             next_token_logits = output.logits[0, -1, :]
+
+            # 5. Apply temperature. Divide logits by temperature before softmax.
+            #    Skip this line if temperature == 1.0 (no-op, saves compute).
             if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token_id = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_token_id.unsqueeze(0)], dim=-1)
-            input_ids = input_ids[:, -1:]
+                next_token_logits = next_token_logits/temperature
+
+            # 6. Softmax: convert logits to probabilities.
+            #    Use F.softmax(..., dim=-1)
+            probs = F.softmax(next_token_logits,dim=-1)
+
+            # 7. Sample one token ID from the probability distribution.
+            #    torch.multinomial(probs, num_samples=1) returns shape [1].
+            next_token_id = torch.multinomial(probs,num_samples=1)
+
+            # 8. Append the new token to input_ids.
+            #    torch.cat([...], dim=-1) joins tensors along the last dimension.
+            #    next_token_id needs to be shape [1, 1] to match input_ids shape [1, seq_len].
+            input_ids = torch.cat([input_ids,next_token_id.unsqueeze(0)], dim=-1)
+
+            # 9. IMPORTANT: for the next loop iteration, input_ids should only contain
+            #    the ONE new token — the KV cache has everything before it.
+            #    Slice input_ids to just the last token.
+            input_ids = input_ids[:,-1:]
+
+            
             generated_ids.append(next_token_id.item())
 
-    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+    # 10. Decode the full token sequence back to text.
+    #     You need all tokens, not just input_ids (which is now just the last one).
+    #     Hint: you need to re-tokenize or keep track of all generated IDs separately.
+    #     Think about this one — what do you need to decode the full output?
+    text = tokenizer.decode(generated_ids,skip_special_tokens=True)
+    return text
 
 
 def speculative_sample_one_step(p: torch.Tensor, q: torch.Tensor, draft_token: int) -> int:
     """
-    One step of speculative decoding rejection sampling.
+    Runs one step of speculative decoding rejection sampling.
 
-    Accepts the draft token with probability min(1, p/q).
-    If rejected, samples from the corrected distribution normalize(max(0, p-q)).
+    Given draft model distribution q and target model distribution p,
+    either accepts the draft token or samples a correction token.
 
     Args:
         p: target model probability distribution, shape [vocab_size]
         q: draft model probability distribution, shape [vocab_size]
-        draft_token: token id sampled by the draft model
+        draft_token: the token id sampled by the draft model
 
     Returns:
         accepted token id (int)
     """
-    acceptance_prob = min(1, p[draft_token] / q[draft_token])
+    # 1. Compute acceptance probability for the draft token.
+    #    Formula: min(1, p[draft_token] / q[draft_token])
+    acceptance_prob = min(1, p[draft_token]/q[draft_token])
+
+    # 2. Draw a random number between 0 and 1.
+    #    torch.rand(1).item() gives a single float.
     r = torch.rand(1).item()
 
+    # 3. If r < acceptance_prob, accept the draft token.
     if r < acceptance_prob:
         return draft_token
 
+    # 4. Otherwise, sample from the corrected distribution.
+    #    Step a: compute max(0, p - q) elementwise
+    #    Step b: normalize so it sums to 1
+    #    Step c: sample one token using torch.multinomial
     corrected = torch.clamp(p - q, min=0)
     corrected = corrected / corrected.sum()
     return torch.multinomial(corrected, num_samples=1).item()
-
 
 def speculative_decode(
     draft_model,
@@ -76,11 +124,13 @@ def speculative_decode(
     temperature: float = 1.0
 ) -> str:
     """
-    Full speculative decoding loop with proper KV cache management.
+    Full speculative decoding loop.
 
-    Context caches are maintained across iterations so each iteration
-    only processes K new tokens through the target model, not the
-    entire growing sequence.
+    Phases each iteration:
+      1. DRAFT:  run draft model K steps, collect token ids and distributions q
+      2. TARGET: run target model once on (context + K draft tokens), get K+1 distributions p
+      3. ACCEPT: rejection sample each draft token, stop at first rejection
+      4. BONUS:  if all K accepted, sample one free token from p[K]
 
     Args:
         draft_model: small fast model (Llama 3.2 1B)
@@ -94,88 +144,87 @@ def speculative_decode(
     Returns:
         generated text as string
     """
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(draft_model.device)
     generated_ids = []
 
-    def softmax_temp(logits):
-        if temperature != 1.0:
-            logits = logits / temperature
-        return F.softmax(logits, dim=-1)
+    draft_past = None
+    target_past = None
 
     with torch.no_grad():
-        # Prime both models on the prompt once.
-        # Gives us KV caches covering the full prompt and the first prediction logit.
-        draft_prime = draft_model(input_ids, use_cache=True)
-        draft_ctx_past = draft_prime.past_key_values
-        draft_next_logit = draft_prime.logits[0, -1, :]
-
-        target_prime = target_model(input_ids, use_cache=True)
-        target_ctx_past = target_prime.past_key_values
-        target_next_logit = target_prime.logits[0, -1, :]
-
         while len(generated_ids) < max_new_tokens:
 
             # ── PHASE 1: DRAFT ──────────────────────────────────────────
+            # Run draft model K steps autoregressively.
+            # Save each token id and its probability distribution.
             draft_tokens = []
             draft_probs = []
+            draft_input = input_ids
 
-            q = softmax_temp(draft_next_logit)
-            tok = torch.multinomial(q, num_samples=1).item()
-            draft_tokens.append(tok)
-            draft_probs.append(q)
+            for _ in range(K):
+                draft_out = draft_model(draft_input, past_key_values=draft_past, use_cache=True)
+                draft_past = draft_out.past_key_values
 
-            draft_past = draft_ctx_past
-            draft_in = torch.tensor([[tok]], device="cuda")
+                logits = draft_out.logits[0, -1, :]
+                if temperature != 1.0:
+                    logits = logits / temperature
+                q = F.softmax(logits, dim=-1)
 
-            for _ in range(K - 1):
-                dout = draft_model(draft_in, past_key_values=draft_past, use_cache=True)
-                draft_past = dout.past_key_values
-                q = softmax_temp(dout.logits[0, -1, :])
-                tok = torch.multinomial(q, num_samples=1).item()
-                draft_tokens.append(tok)
+                token = torch.multinomial(q, num_samples=1).item()
+                draft_tokens.append(token)
                 draft_probs.append(q)
-                draft_in = torch.tensor([[tok]], device="cuda")
+
+                draft_input = torch.tensor([[token]], device=draft_model.device)
 
             # ── PHASE 2: TARGET ─────────────────────────────────────────
-            # Pass only K draft tokens — target_ctx_past holds the full context.
-            draft_tensor = torch.tensor([draft_tokens], device="cuda")
-            tout = target_model(draft_tensor, past_key_values=target_ctx_past, use_cache=True)
-            target_logits = tout.logits[0]  # shape [K, vocab_size]
+            # Run target model ONCE on (context + all K draft tokens).
+            # This gives K+1 distributions in one forward pass.
+            draft_tensor = torch.tensor([draft_tokens], device=target_model.device)
+            target_input = torch.cat([input_ids.to(target_model.device), draft_tensor], dim=-1)
+
+            target_out = target_model(target_input, past_key_values=target_past, use_cache=True)
+            target_past = target_out.past_key_values
+
+            target_logits = target_out.logits[0]  # shape [seq_len, vocab_size]
 
             # ── PHASE 3: ACCEPT ─────────────────────────────────────────
-            # draft_token[0] verified against target_next_logit (from previous iteration).
-            # draft_token[i] verified against target_logits[i-1].
+            # For each draft token, run rejection sampling.
+            # Stop at first rejection.
             accepted = []
             all_accepted = True
+            n = input_ids.shape[1]  # length of current context
 
             for i, (token, q) in enumerate(zip(draft_tokens, draft_probs)):
-                p = softmax_temp(target_next_logit if i == 0 else target_logits[i - 1])
+                logits_i = target_logits[n - 1 + i]
+                if temperature != 1.0:
+                    logits_i = logits_i / temperature
+                p = F.softmax(logits_i, dim=-1).to(q.device)
+
                 accepted_token = speculative_sample_one_step(p, q, token)
                 accepted.append(accepted_token)
+
                 if accepted_token != token:
                     all_accepted = False
                     break
 
             # ── PHASE 4: BONUS ──────────────────────────────────────────
+            # If all K draft tokens were accepted, sample one free token
+            # from the target distribution at position K.
             if all_accepted:
-                bonus_p = softmax_temp(target_logits[K - 1])
+                bonus_logits = target_logits[n - 1 + K]
+                if temperature != 1.0:
+                    bonus_logits = bonus_logits / temperature
+                bonus_p = F.softmax(bonus_logits, dim=-1)
                 bonus_token = torch.multinomial(bonus_p, num_samples=1).item()
                 accepted.append(bonus_token)
 
-            # ── UPDATE CACHES ────────────────────────────────────────────
-            # Advance both context caches with accepted tokens only.
-            accepted_tensor = torch.tensor([accepted], device="cuda")
-
-            d_update = draft_model(accepted_tensor, past_key_values=draft_ctx_past, use_cache=True)
-            draft_ctx_past = d_update.past_key_values
-            draft_next_logit = d_update.logits[0, -1, :]
-
-            t_update = target_model(accepted_tensor, past_key_values=target_ctx_past, use_cache=True)
-            target_ctx_past = t_update.past_key_values
-            target_next_logit = t_update.logits[0, -1, :]
-
+            # Update context and generated list
             generated_ids.extend(accepted)
+            new_tokens = torch.tensor([accepted], device=input_ids.device)
+            input_ids = torch.cat([input_ids, new_tokens], dim=-1)
+
+            # Reset caches — context has changed, caches are now stale
+            draft_past = None
+            target_past = None
 
     return tokenizer.decode(generated_ids[:max_new_tokens], skip_special_tokens=True)
-
 

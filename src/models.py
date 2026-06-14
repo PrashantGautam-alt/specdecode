@@ -9,12 +9,13 @@ class ModelLoader:
     the draft model and target model in speculative decoding.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device: str = "cuda:0"):
         """
         model_name: HuggingFace model ID, e.g. 'meta-llama/Llama-3.2-1B'
+        device: which GPU to load onto, e.g. 'cuda:0' or 'cuda:1'
         """
         self.model_name = model_name
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device if torch.cuda.is_available() else "cpu"
         self.model = None
         self.tokenizer = None
 
@@ -28,7 +29,7 @@ class ModelLoader:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,  # half precision saves VRAM without much quality loss
+            dtype=torch.float16,  # half precision saves VRAM without much quality loss
             device_map=self.device,
         )
 
@@ -36,3 +37,8 @@ class ModelLoader:
 
         print(f"Loaded. Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         return self
+
+
+
+
+
