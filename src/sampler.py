@@ -1,7 +1,7 @@
 
-
 import torch
 import torch.nn.functional as F
+from transformers.cache_utils import DynamicCache
 
 
 def naive_generate(model, tokenizer, prompt: str, max_new_tokens: int = 50, temperature: float = 1.0) -> str:
@@ -115,10 +115,11 @@ def speculative_sample_one_step(p: torch.Tensor, q: torch.Tensor, draft_token: i
     return torch.multinomial(corrected, num_samples=1).item()
 
 def _trim_kv_cache(past_key_values, keep_length):
-    return tuple(
-        (k[:, :, :keep_length, :], v[:, :, :keep_length, :])
-        for k, v in past_key_values
-    )
+    trimmed = DynamicCache()
+    for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+        trimmed.key_cache.append(k[:, :, :keep_length, :])
+        trimmed.value_cache.append(v[:, :, :keep_length, :])
+    return trimmedgit add src/sampler.py
 
 def speculative_decode(
     draft_model,
