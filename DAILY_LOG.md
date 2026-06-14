@@ -182,11 +182,11 @@ PASSED
 ### Day 4 — The Full Speculative Decoding Loop
 **Goal:** Combine draft model, target model, and rejection sampling into one working loop.
 
-**Status:** IN PROGRESS — code complete, benchmark blocked by GPU contention
+**Status:** DONE (completed 2026-06-14)
 
 **Deliverable:**
-- [x] `src/sampler.py` — `speculative_decode()` written with proper KV cache management
-- [ ] First speedup number measured vs naive baseline — BLOCKED (Ollama server occupying both GPUs)
+- [x] `src/sampler.py` — `speculative_decode()` written with persistent KV cache
+- [x] First speedup number measured: **1.04x** (Naive 8B: 37.9 tok/s, Speculative K=4: 39.4 tok/s)
 - [x] I can explain the 4 phases: Draft → Target → Accept → Bonus Token
 
 **What I learned today:**
@@ -228,8 +228,12 @@ PASSED
 **Blockers / Questions:**
 *(fill in)*
 
-**Starting Point for Next Session:**
-*(fill in)*
+**Starting Point for Next Session (Day 5):**
+1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`
+2. Write `scripts/k_sweep.py` — loops over K ∈ {1, 2, 4, 6, 8}, records tok/s and speedup for each
+3. Run the sweep and record all numbers in this log
+4. Identify peak K and explain why that K wins
+5. Key question to answer: why does 1.04x feel low? Is it acceptance rate or overhead?
 
 ---
 
@@ -338,9 +342,9 @@ PASSED
 | Metric | Value | Date measured |
 |---|---|---|
 | Baseline (1B naive) tok/s | 83.3 | 2026-06-13 |
-| Baseline (8B naive) tok/s | | |
-| SpecDecode-Small tok/s | | |
-| SpecDecode-Small speedup | | |
+| Baseline (8B naive) tok/s | 37.9 | 2026-06-14 |
+| SpecDecode-Small tok/s | 39.4 | 2026-06-14 |
+| SpecDecode-Small speedup | 1.04x (K=4) | 2026-06-14 |
 | Best acceptance rate | | |
 | Best K value | | |
 | Medusa tok/s | | |
