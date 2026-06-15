@@ -291,6 +291,9 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 - Owed explain-back: "why can't the heads live in a plain Python list?" (PyTorch only tracks modules in proper attributes / nn.ModuleList; a plain list hides their params from `.parameters()`, `.to(device)`, and the optimizer).
 
 **Starting Point for Next Session (Day 6 continued):**
+
+> ⚠️ FIRST, before any code: the user said at the end of this session that **something from Day 6 felt fuzzy** but was too sleepy to name it, and asked to be reminded. Ask: *"You said something from Day 6 felt fuzzy — what was it? Let's clear it up."* (Likely candidates: SiLU, the residual `+ h`, the init trick, freezing, `nn.ModuleList`, or what `h` is.)
+
 1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`, `git pull origin main`
 2. Finish the **init trick** in `MedusaModel.__init__` (half 1 then half 2 — see "MedusaModel progress" above). New tool: `nn.init.zeros_` (in-place; trailing `_` = modify in place).
 3. Write **`MedusaModel.forward`**: get `h` via `output_hidden_states=True`, feed it to each head, return K predictions.
