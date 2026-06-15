@@ -262,21 +262,40 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 ### Day 6 — Medusa Heads: Architecture and Implementation
 **Goal:** Understand and implement the Medusa head architecture.
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (2026-06-15 / 16) — MedusaHead DONE, MedusaModel __init__ ~75% built
 
 **Deliverable:**
-- [ ] `src/medusa.py` — `MedusaHead` and `MedusaModel` classes written
-- [ ] Training script started on IEOR server (let it run overnight)
-- [ ] I can explain: what a Medusa head is, why it's attached to the base model, what SiLU does
+- [x] `src/medusa.py` — `MedusaHead` written and verified: `W2(SiLU(W1(h)) + h)`, dims parametrized
+- [~] `src/medusa.py` — `MedusaModel` __init__ in progress (backbone stored + frozen + heads created; init trick still to do; forward not started)
+- [ ] Training script `scripts/train_medusa.py` — not started
+- [x] I can explain: what a Medusa head is, why it's attached to the base model, what SiLU does
 
-**What I learned today:**
-*(fill in)*
+**What I learned today (all captured in CONCEPTS.md):**
+- Medusa head = small MLP on the final hidden state `h`, sitting PARALLEL to the LM head (not on top). Head k predicts position t+k+1. Formula `W2(SiLU(W1·h) + h)`.
+- SiLU `= x·sigmoid(x)`; why non-linearity is needed (linear-of-linear collapses → can't do XOR); why SiLU beats ReLU (smooth, no dead neurons, Llama uses it).
+- Residual `+ h`: the head learns a small adjustment to `h`, not the whole map.
+- Init trick: start each head as an EXACT clone of the LM head (W1=0, W2=LM head copy); the `+ h` is what makes zero-init degrade to "exactly the LM head" instead of garbage.
+- What `h` is: the 4096-dim last hidden state = the model's compressed understanding; the `logits` we used since Day 2 come one step AFTER `h`.
+- Training economics: frozen backbone = no gradients/optimizer for the 8B → cheap; weights untouched → safe. QLoRA = quantize + LoRA to train big models on one GPU.
+- PyTorch mechanics: nn.Module (init declares weighted parts, forward = the math; CALL `head(h)` not `head.forward(h)`); nn.Linear is CALLED not multiplied (`W1(h)`, not `W1*h`); nn.ModuleList (a plain list would hide the heads from PyTorch); `requires_grad=False` to freeze.
+
+**MedusaModel progress so far (`src/medusa.py`):**
+- `__init__(self, backbone, num_heads)`: stores backbone; freezes it (`for p in backbone.parameters(): p.requires_grad = False`); creates `num_heads` MedusaHeads in an `nn.ModuleList`, sized from `backbone.config.hidden_size` / `vocab_size`.
+- STILL TO DO in __init__ — the **init trick**, in two halves:
+  - half 1 (NEXT): for each head, `nn.init.zeros_(head.W1.weight)` AND `nn.init.zeros_(head.W1.bias)` — bias too, so the SiLU branch is exactly 0.
+  - half 2: `head.W2.weight.data.copy_(self.backbone.lm_head.weight.data)` and `nn.init.zeros_(head.W2.bias)` — so `W2·h` exactly matches the bias-free LM head.
+- THEN `MedusaModel.forward`: run backbone with `output_hidden_states=True` to get `h`, feed `h` to every head, return the K predictions.
 
 **Blockers / Questions:**
-*(fill in)*
+- None. GPUs free this session.
+- Owed explain-back: "why can't the heads live in a plain Python list?" (PyTorch only tracks modules in proper attributes / nn.ModuleList; a plain list hides their params from `.parameters()`, `.to(device)`, and the optimizer).
 
-**Starting Point for Next Session:**
-*(fill in)*
+**Starting Point for Next Session (Day 6 continued):**
+1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`, `git pull origin main`
+2. Finish the **init trick** in `MedusaModel.__init__` (half 1 then half 2 — see "MedusaModel progress" above). New tool: `nn.init.zeros_` (in-place; trailing `_` = modify in place).
+3. Write **`MedusaModel.forward`**: get `h` via `output_hidden_states=True`, feed it to each head, return K predictions.
+4. Then start **`scripts/train_medusa.py`** — the training loop. Loss from CONCEPTS.md / paper eq. 1: per-head cross-entropy, weighted by `λk = 0.8^k`.
+5. Remember the WHY: Medusa exists to kill the `0.40 × K` draft tax from Day 5 — the heads ride the target's own forward pass instead of a separate model run K times.
 
 ---
 

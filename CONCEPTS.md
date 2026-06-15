@@ -108,3 +108,38 @@ token ID -> embedding -> [ Layer 1 -> ... -> Layer 32 ] -> h -> LM head -> logit
 `h` sits right after the final layer, just *before* the LM head. The `logits` we used since
 Day 2 (`output.logits[0, -1, :]`) are what comes one step *after* `h`. The Medusa heads tap
 `h` directly — the model's finished thought — to look further ahead.
+
+---
+
+## Day 6 — PyTorch mechanics (how the concepts become code)
+
+### nn.Module — the base class for any model component
+- Subclass it. Define two methods:
+  - `__init__`: declare the parts that HAVE weights (the layers). First line must be `super().__init__()`.
+  - `forward`: the actual math / computation.
+- You CALL the module like a function — `head(h)`, NOT `head.forward(h)`. PyTorch routes the call to `forward`.
+- Why it exists: nn.Module auto-tracks every weight inside it, so the optimizer can find them,
+  `.to(device)` moves them, and save/load works.
+
+### nn.Linear — one linear layer (your W1, W2)
+- `nn.Linear(in_features, out_features)` computes `y = x · W^T + b` and HOLDS the weight matrix for you.
+- Apply it by CALLING it: `self.W1(h)`. Do NOT write `self.W1 * h` — a module is not a matrix you
+  multiply; `*` raises a TypeError. The `·` in the math = a function call in code.
+
+### nn.ModuleList — a list PyTorch can see into
+- Holds a list of sub-modules (e.g. the K heads) and properly REGISTERS them.
+- A plain Python list does NOT register: the modules' weights become invisible to `.parameters()`,
+  are never moved by `.to(device)`, and are never trained. Always use nn.ModuleList for a list of layers.
+
+### Freezing — requires_grad = False
+- Every learnable weight is a Parameter with a flag `requires_grad`.
+- True (default): a gradient is computed in the backward pass and the optimizer can update it (costs compute + memory).
+- False: no gradient, no update — frozen. The expensive backward work for that weight is skipped.
+- Freeze a whole model: `for p in model.parameters(): p.requires_grad = False`.
+- Same family as the `with torch.no_grad():` used for inference — but permanent and per-weight.
+
+### nn.init.zeros_ — in-place weight init
+- `nn.init.zeros_(tensor)` fills a tensor with zeros, in place.
+- Trailing `_` = PyTorch convention for "modify in place" (returns nothing new).
+- For the init trick, zero BOTH `W1.weight` and `W1.bias`: `W1(h) = weight·h + bias`, so both must be
+  zero for the SiLU branch to vanish exactly.
