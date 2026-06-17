@@ -10,7 +10,7 @@ if __name__ == "__main__":
     loader.load()
     backbone = loader.model
     tokenizer = loader.tokenizer
-    medusa = MedusaModel(backbone, num_heads=4).to("cuda:0").to(dtype=torch.float16)
+    medusa = MedusaModel(backbone, num_heads=4).to("cuda:0")  # heads stay float32 for stable training; backbone is already float16
     optimizer = torch.optim.AdamW(medusa.heads.parameters(), lr=1e-3)
 
     TRAIN_TEXT = [
