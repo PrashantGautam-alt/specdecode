@@ -78,44 +78,74 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     total_accepted = 0
     rounds = 0
 
+    # PRIME: run all prompt tokens except the last through the backbone once.
+    # This builds the starting cache so the loop never recomputes the full context.
+    # We exclude the last token because PROPOSE will process it first each round.
+    with torch.no_grad():
+        prime_out = medusa.backbone(input_ids=generated[:, :-1], use_cache=True)
+    cache = prime_out.past_key_values
+
     while generated.shape[1] < start_len + max_new_tokens:
-        # PHASE 1 — PROPOSE: each head's argmax at the LAST position is its guess for the
-        # next K positions. This is the "draft" — but it rides the backbone's own forward
-        # pass (inside medusa()), so there is no separate draft model and no 0.40*K tax.
+        # PHASE 1 — PROPOSE: process only the last token using the cache (O(1) cost).
+        # The backbone returns the hidden state h at that position — the heads read h
+        # to propose K candidates. backbone_preds_0 is what the backbone itself would
+        # say next, obtained for free from the same pass.
         with torch.no_grad():
-            head_logits = medusa(generated)
-        candidates = [head_logits[k][0, -1, :].argmax().item() for k in range(K)]
+            propose_out = medusa.backbone(
+                input_ids=generated[:, -1:],
+                past_key_values=cache,
+                output_hidden_states=True,
+                use_cache=True,
+            )
+        full_cache = propose_out.past_key_values
+        backbone_preds_0 = propose_out.logits[0, -1, :].argmax().item()
+        h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
+        candidates = [medusa.heads[k](h)[0, -1, :].argmax().item() for k in range(K)]
 
-        # PHASE 2 — VERIFY: feed [context + the first K-1 candidates] through the backbone
-        # once. We append only K-1: the backbone's logits at the last real token already
-        # predict candidate 0, and each appended candidate lets it predict the next one.
-        # The backbone's argmax at the final K positions = what the big model itself would
-        # say at those positions, which is our ground truth.
-        cand_tensor = torch.tensor([candidates[:-1]], device=device, dtype=torch.long)
-        verify_input = torch.cat([generated, cand_tensor], dim=1)
+        # PHASE 2 — VERIFY: feed only the K-1 candidates through the backbone using
+        # full_cache (O(K) cost, independent of sequence length).
+        # backbone_preds[0] already came from PROPOSE; verify gives us [1..K-1].
+        cand_tensor = torch.tensor([candidates[:K-1]], device=device, dtype=torch.long)
         with torch.no_grad():
-            verify_logits = medusa.backbone(input_ids=verify_input).logits
-        backbone_preds = verify_logits[0, -K:, :].argmax(dim=-1)  # [K] true next tokens
+            verify_out = medusa.backbone(
+                input_ids=cand_tensor,
+                past_key_values=full_cache,
+                use_cache=True,
+            )
+        verify_preds = verify_out.logits[0, :, :].argmax(dim=-1).tolist()
+        backbone_preds = [backbone_preds_0] + verify_preds
 
-        # PHASE 3 — ACCEPT: walk left to right. We always emit the BACKBONE's token, never
-        # the candidate — that is why the output stays byte-for-byte identical to plain
-        # greedy decoding of the backbone (Medusa changes the SPEED, not the result). A
-        # matching candidate means the head guessed right, so we continue; the first
-        # mismatch is where the heads were wrong, so we emit the backbone's correction and
-        # stop — every later candidate was built on a now-wrong prefix and is worthless.
+        # PHASE 3 — ACCEPT: walk left to right. We always emit the backbone's token,
+        # never the candidate — output stays identical to plain greedy decoding.
+        # Stop at the first mismatch: every later candidate used a wrong prefix.
         new_tokens = []
         for i in range(K):
-            new_tokens.append(backbone_preds[i].item())
-            if backbone_preds[i].item() != candidates[i]:
+            new_tokens.append(backbone_preds[i])
+            if backbone_preds[i] != candidates[i]:
                 break
 
-        # PHASE 4 — APPEND the accepted tokens (plus the correction) and loop.
+        # PHASE 4 — UPDATE CACHE then APPEND accepted tokens.
+        # We can't reuse verify's KV: it was computed with candidates, and a mismatch
+        # means a wrong token was fed in — contaminating the cache past that point.
+        # Re-feeding accepted[:-1] is always correct and costs at most K-1 tokens.
+        m = len(new_tokens)
+        if m == 1:
+            cache = full_cache
+        else:
+            update_input = torch.tensor([new_tokens[:-1]], device=device, dtype=torch.long)
+            with torch.no_grad():
+                update_out = medusa.backbone(
+                    input_ids=update_input,
+                    past_key_values=full_cache,
+                    use_cache=True,
+                )
+            cache = update_out.past_key_values
         new_tensor = torch.tensor([new_tokens], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
         rounds += 1
-        total_accepted += len(new_tokens)
+        total_accepted += m
         if verbose:
-            print(f"  round {rounds}: accepted {len(new_tokens)}/{K} tokens")
+            print(f"  round {rounds}: accepted {m}/{K} tokens")
 
     if verbose:
         print(f"  avg tokens/round: {total_accepted / rounds:.2f} over {rounds} rounds")
