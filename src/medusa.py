@@ -104,6 +104,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
                 use_cache=True,
             )
         full_cache = snap(propose_out.past_key_values)
+        update_cache = snap(full_cache)   # clean n-token snapshot for PHASE 4; full_cache will be mutated by VERIFY
         backbone_preds_0 = propose_out.logits[0, -1, :].argmax().item()
         h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
         candidates = [medusa.heads[k](h)[0, -1, :].argmax().item() for k in range(K)]
@@ -136,13 +137,13 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
         # Re-feeding accepted[:-1] is always correct and costs at most K-1 tokens.
         m = len(new_tokens)
         if m == 1:
-            cache = full_cache
+            cache = update_cache
         else:
             update_input = torch.tensor([new_tokens[:-1]], device=device, dtype=torch.long)
             with torch.no_grad():
                 update_out = medusa.backbone(
                     input_ids=update_input,
-                    past_key_values=full_cache,
+                    past_key_values=update_cache,
                     use_cache=True,
                 )
             cache = snap(update_out.past_key_values)
