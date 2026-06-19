@@ -73,6 +73,8 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     prefix (greedy verification = match the backbone's own argmax).
     """
     device = next(medusa.backbone.parameters()).device
+    def snap(kv):
+        return kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
     generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     start_len = generated.shape[1]  # where the prompt ends; we stop max_new_tokens past it
     total_accepted = 0
@@ -83,7 +85,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     # We exclude the last token because PROPOSE will process it first each round.
     with torch.no_grad():
         prime_out = medusa.backbone(input_ids=generated[:, :-1], use_cache=True)
-    cache = prime_out.past_key_values
+    cache = snap(prime_out.past_key_values)
 
     while generated.shape[1] < start_len + max_new_tokens:
         # PHASE 1 — PROPOSE: process only the last token using the cache (O(1) cost).
@@ -97,7 +99,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
                 output_hidden_states=True,
                 use_cache=True,
             )
-        full_cache = propose_out.past_key_values
+        full_cache = snap(propose_out.past_key_values)
         backbone_preds_0 = propose_out.logits[0, -1, :].argmax().item()
         h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
         candidates = [medusa.heads[k](h)[0, -1, :].argmax().item() for k in range(K)]
@@ -139,7 +141,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
                     past_key_values=full_cache,
                     use_cache=True,
                 )
-            cache = update_out.past_key_values
+            cache = snap(update_out.past_key_values)
         new_tensor = torch.tensor([new_tokens], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
         rounds += 1
