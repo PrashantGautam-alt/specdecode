@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from transformers import DynamicCache
 
 class MedusaHead(nn.Module):
     def __init__(self, hidden_dim, vocab_size):
@@ -73,8 +74,11 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     prefix (greedy verification = match the backbone's own argmax).
     """
     device = next(medusa.backbone.parameters()).device
+
     def snap(kv):
-        return kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
+        legacy = kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
+        return DynamicCache.from_legacy_cache(legacy)
+
     generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     start_len = generated.shape[1]  # where the prompt ends; we stop max_new_tokens past it
     total_accepted = 0
