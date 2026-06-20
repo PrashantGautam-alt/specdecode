@@ -36,7 +36,7 @@ if __name__ == "__main__":
         for example in ds:
             message = example["messages"]
             text = tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt = False)
-            input_ids = tokenizer(text, return_tensors="pt", max_length=2048, truncation=True).input_ids.to("cuda:0")
+            input_ids = tokenizer(text, return_tensors="pt", max_length=512, truncation=True).input_ids.to("cuda:0")
             head_logits = medusa(input_ids)
 
             loss = 0.0
