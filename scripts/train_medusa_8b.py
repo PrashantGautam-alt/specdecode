@@ -28,19 +28,18 @@ if __name__ == "__main__":
     # """Hypertension is one of the most prevalent chronic diseases worldwide and is a major risk factor for heart attack, stroke, kidney disease, and heart failure. Early detection through routine screening and appropriate treatment with lifestyle modifications and antihypertensive medications can significantly reduce morbidity and mortality. Patients are encouraged to maintain a healthy diet, engage in regular physical activity, avoid tobacco use, and follow medical advice consistently over time."""
     # ]
 
-    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:10000]")
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:25000]")
 
     epochs = 2
     for epoch in range(epochs):
         epoch_loss = 0.0
         for example in ds:
             message = example["messages"]
-            text = tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt = False)
+            text = tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=False)
             input_ids = tokenizer(text, return_tensors="pt", max_length=512, truncation=True).input_ids.to("cuda:0")
             head_logits = medusa(input_ids)
 
             loss = 0.0
-
 
             for k in range(len(head_logits)):
                 shift = k+1
@@ -53,8 +52,7 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        # print(f"epoch {epoch}: loss {epoch_loss/len(TRAIN_TEXT):.4f}")
         print(f"epoch {epoch}: loss {epoch_loss/len(ds):.4f}")
-    torch.save(medusa.heads.state_dict(), "medusa_heads_8b.pt")
+        torch.save(medusa.heads.state_dict(), f"medusa_heads_8b_epoch{epoch}.pt")
 
 
