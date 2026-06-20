@@ -143,3 +143,169 @@ Day 2 (`output.logits[0, -1, :]`) are what comes one step *after* `h`. The Medus
 - Trailing `_` = PyTorch convention for "modify in place" (returns nothing new).
 - For the init trick, zero BOTH `W1.weight` and `W1.bias`: `W1(h) = weight·h + bias`, so both must be
   zero for the SiLU branch to vanish exactly.
+
+---
+
+## Day 6 — Training the heads
+
+### `forward`: why `hidden_states[-1]`, not `logits`
+- A default model call returns only `.logits`. Pass `output_hidden_states=True` to expose `.hidden_states`
+  (a tuple: embeddings + one per layer). Take `[-1]` = final layer = the cooked `h`.
+- Heads eat `h`, NOT `logits`: logits are a LOSSY projection of `h` aimed at ONE position (t+1). Each head
+  aims at a DIFFERENT future position, so it needs the full `h` — the future is already discarded in logits.
+
+### Device + dtype must match
+- Any op needs both tensors on the same DEVICE and in the same DTYPE, or it crashes.
+- Heads are born on CPU/float32; backbone is on cuda/float16. `.to("cuda:0", dtype=...)` fixes both.
+- This is why `nn.ModuleList` mattered: one `.to(...)` sweeps all heads (a plain list wouldn't).
+
+### `torch.allclose` (the init-trick runtime proof)
+- `==` on floats can be False even for "equal" values: the same number reached by a different ORDER of
+  operations rounds differently in the last bit (e.g. `0.1+0.2 != 0.3`).
+- `allclose(a, b, rtol, atol)` allows a tolerance: `|a−b| ≤ atol + rtol·|b|`. Float16 is coarse → use ~1e-3.
+- Sanity check printed `True`: a fresh head's output == `lm_head(h)`. Init trick proven, not just on paper.
+
+### The target SHIFT (THE Medusa training idea)
+- Head k predicts t+k+1, so its labels are the input shifted left by `shift = k+1`.
+- Align: `logits_k = head_logits[k][:, :-shift, :]` (drop last `shift` — no answer past the end);
+  `labels_k = input_ids[:, shift:]` (drop first `shift`). Both end up length `seq_len − shift`.
+- Logits are 3-D `[batch, pos, vocab]`; labels are 2-D `[batch, pos]` (one token ID, no vocab dim).
+- WHY different shifts: same shift → all heads learn the identical "next token" → redundant. Different
+  shifts force each head to own a future slot, so together they propose a CHAIN.
+
+### Weighted loss `λk = 0.8^k`
+- `L_total = Σ 0.8^k · L_k`. Weights decay: 1, 0.8, 0.64, 0.512.
+- WHY down-weight far heads: (1) far future is harder → big noisy loss; equal weights let it DOMINATE the
+  gradient and starve the near heads. (2) acceptance is sequential — head 0 wrong wastes the round, so near
+  heads are worth more. Weight each head by its real contribution → a decreasing schedule.
+
+### Cross-entropy + the reshape
+- CE = negative log-likelihood; minimizing it = maximum likelihood.
+- `F.cross_entropy` wants flat shapes: predictions `[N, C]`, answers `[N]`. Our slices are `[1, P, vocab]`
+  and `[1, P]` → `logits.reshape(-1, vocab)` and `labels.reshape(-1)`. `-1` = "compute this dim to fit".
+
+### The optimizer + the training heartbeat
+- `AdamW(medusa.heads.parameters(), lr=1e-3)` — ONLY the heads (frozen backbone = no decision variables).
+- Order: `zero_grad()` → `backward()` → `step()`. zero FIRST because PyTorch ACCUMULATES gradients by
+  default — without clearing, this step's gradient piles onto the last one → wrong descent direction.
+- `.item()` = pull the plain Python number out of a 1-value tensor (for logging only; never feed back).
+
+### float16 NaN → mixed precision (float32 heads)
+- fp16 window: max ~65,504, min normal ~6e-5. Training leaves it: softmax `exp(12)≈163k` OVERFLOWS → inf;
+  tiny gradients UNDERFLOW → 0. Adam's divide by `sqrt(v)` turns inf/inf or 0/0 → NaN, from epoch 0.
+- Fix (mixed precision): frozen backbone stays fp16 (no gradients, saves memory); trainable heads → fp32;
+  cast `h` to the heads' dtype in `forward`. float32's range (~3e38) holds the same values safely.
+
+### Saving the heads: `state_dict` + `torch.save`
+- `state_dict()` = dict of `name → weight tensor`. Save `medusa.heads.state_dict()` ONLY (backbone unchanged).
+- `torch.save(obj, "medusa_heads.pt")` writes it; reload with `load_state_dict(torch.load(...))`.
+- It's the SAVED SOLUTION of the optimization — train once, reuse forever (Day 7 decoding loads it).
+
+---
+
+## Day 7 — Medusa decoding
+
+### `medusa_decode` — the 4 phases
+- Speculative decoding with the heads AS the draft (no separate model). One round:
+  1. **PROPOSE** — run model once; each head's argmax at the last position → a chain of K candidate tokens.
+  2. **VERIFY** — feed `[context + first K−1 candidates]` through the backbone once; its argmax at the last
+     K positions = the big model's own picks (ground truth). K−1 because the last real token already
+     predicts candidate 0, and each appended candidate unlocks the next.
+  3. **ACCEPT** — walk left to right, ALWAYS emit the backbone's token; match = head right (continue);
+     first mismatch = emit the correction and stop.
+  4. **APPEND** and loop.
+- **Correctness guarantee:** every emitted token is the backbone's own argmax → output is IDENTICAL to plain
+  greedy decoding. Medusa changes SPEED, not the result. Worst case 1 token/round; best case K.
+- **Greedy verification** means we always accept the backbone's argmax. The exact rejection-sampling
+  version (Day 3's `min(1, p/q)`) is the refinement for sampled (temperature > 0) decoding.
+
+---
+
+## Day 7 — Persistent KV cache in `medusa_decode`
+
+### Why the naive version was O(n²)
+
+The first `medusa_decode` had no KV cache. Every round, it fed the entire growing sequence through the backbone from scratch. After M tokens were accepted, the next round re-read M tokens again — then M+1, then M+2. Total work grows quadratically with length. Same Day-4 trap.
+
+**Fix — four phases with a persistent cache:**
+
+1. **PRIME** — run the whole prompt (minus the last token) through the backbone once; save the resulting `DynamicCache`. Never recomputed.
+2. **PROPOSE** — feed only the last token through using the cache (O(1)). Gets `h` for the heads AND the backbone's own prediction for candidate 0. Heads argmax on `h` → K candidate tokens.
+3. **VERIFY** — feed the first K-1 candidates through using a snapshot of the PROPOSE cache. Backbone's argmax at positions 1..K-1, combined with PROPOSE's position-0 prediction = full K opinions.
+4. **UPDATE CACHE** — re-feed `accepted[:-1]` into a clean PROPOSE snapshot to advance the cache. At most K-1 tokens, regardless of total sequence length.
+
+**Why VERIFY's cache can't be reused for UPDATE:** if a mismatch occurred at position i, the tokens at i+1 onward were wrong. The KV vectors for those positions are contaminated. The clean PROPOSE snapshot is the last known-good state.
+
+---
+
+### The DynamicCache in-place mutation bug
+
+`DynamicCache` is **mutable and modified in place** during every forward pass — the backbone appends the new K/V vectors into whatever object you pass. Passing the same cache object to both VERIFY and UPDATE meant VERIFY contaminated it before UPDATE could use it.
+
+**Fix — `snap()`:**
+
+```python
+def snap(kv):
+    legacy = kv.to_legacy_cache()
+    return DynamicCache.from_legacy_cache(legacy)
+```
+
+Round-trips the cache through the legacy tuple format, creating a **fresh, independent object** with the same K/V contents. Two snapshots are made after PROPOSE: `full_cache` (expendable, given to VERIFY) and `update_cache` (clean, reserved for UPDATE). Mutations to one can't reach the other.
+
+---
+
+## Day 7 / Route B — Multi-GPU training and 8-bit Adam
+
+### 8-bit Adam — what it compresses and why
+
+Adam stores **three things per trainable parameter:**
+- The parameter itself (float32)
+- **m** (first moment): running average of recent gradients — which direction has the gradient been pointing?
+- **v** (second moment): running average of squared gradients — how noisy/consistent has the gradient been?
+
+Update rule: `param -= lr * m / (sqrt(v) + epsilon)`. The ratio adapts the step size per parameter.
+
+**The memory cost:** parameter + m + v = 3× storage per trainable weight.
+
+For 4 Medusa heads (~2.2B params): 8.8 GB params + 17.6 GB (m + v) + 16 GB backbone = ~42 GB before activations — spills over 48 GB (2× A5000).
+
+**8-bit Adam** (`bitsandbytes.optim.Adam8bit`) quantizes **m and v** to 8-bit integers (4× compression): 17.6 GB → 4.4 GB. Parameters stay float32.
+
+**Why we can compress m/v but not parameters:**
+- m and v are **estimates** used as multipliers. A small quantization error = a slightly imprecise step — the optimizer self-corrects over many iterations.
+- Parameters are **accumulators**. Each update adds a tiny delta (maybe `1e-5`). In 8-bit (step ~0.008), that delta rounds to zero and is never applied — training silently stalls.
+
+Rule: **quantize what you USE (optimizer stats), not what you ACCUMULATE (parameters).**
+
+**What is actually compressed vs not — the full picture:**
+
+| Thing | Precision | Why |
+|---|---|---|
+| Backbone weights | float16 | Saves memory; frozen so no gradient risk |
+| Head weights (W1, W2) | **float32** | Accumulate tiny updates — can't quantize |
+| Adam m and v | **8-bit** | Estimates used as multipliers — small error is fine |
+| Saved `.pt` file | float32 | Head weights only, full precision |
+
+The heads themselves are **not** compressed — trained and saved in full float32. 8-bit Adam compresses Adam's internal notebook (m and v), not the building it's renovating (the weights).
+
+---
+
+### Multi-GPU device placement (Route B)
+
+Backbone on `cuda:0` (float16), heads on `cuda:1` (float32).
+
+```python
+medusa = MedusaModel(backbone, num_heads=4)
+medusa.heads.to("cuda:1")
+optimizer = bnb.optim.Adam8bit(medusa.heads.parameters(), lr=1e-3)
+```
+
+**The tensor boundary:** `h` comes off `cuda:0` (backbone). Heads are on `cuda:1`. Fix in `medusa.py` forward:
+
+```python
+h = h.to(device=self.heads[0].W1.weight.device, dtype=self.heads[0].W1.weight.dtype)
+```
+
+Reads device and dtype from the heads' own weights — correct by construction regardless of placement. Hardcoding `"cuda:1"` would be fragile.
+
+**`.pt` files:** binary (Python pickle). Not human-readable — never open in nvim (exit with `:q!`). Not for GitHub (can't diff, bloat history, hit 100 MB limits). Real checkpoints go on HuggingFace Hub; toy checkpoints excluded via `*.pt` in `.gitignore`.

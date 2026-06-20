@@ -2,7 +2,7 @@
 
 **Project start date:** 2026-06-06  
 **Target end date:** 2026-06-28 (18 days core — extended roadmap with Adaptive K)  
-**Current day:** DAY 5 COMPLETE (2026-06-14). SpecDecode beats naive — **1.17x at K=4** (instruct draft). Next up: Day 6 — Medusa heads.
+**Current day:** DAY 6 DONE (2026-06-17). `forward` finished; init trick proven on GPU (`Init trick holds: True`); full Medusa training pipeline built + validated on 1B (loss 26.5 → 0.063). DAY 7 STARTED — `medusa_decode()` written (correctness-first, no KV cache yet; explain-back owed). Headline still stands: SpecDecode beats naive — **1.17x at K=4** (instruct draft).
 
 ---
 
@@ -262,12 +262,13 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 ### Day 6 — Medusa Heads: Architecture and Implementation
 **Goal:** Understand and implement the Medusa head architecture.
 
-**Status:** IN PROGRESS (2026-06-15 / 16) — MedusaHead DONE, MedusaModel __init__ ~75% built
+**Status:** DONE (2026-06-17) — `forward` finished, init trick proven on GPU, training pipeline built + validated on the 1B (loss 26.5 → 0.063).
 
 **Deliverable:**
 - [x] `src/medusa.py` — `MedusaHead` written and verified: `W2(SiLU(W1(h)) + h)`, dims parametrized
-- [~] `src/medusa.py` — `MedusaModel` __init__ in progress (backbone stored + frozen + heads created; init trick still to do; forward not started)
-- [ ] Training script `scripts/train_medusa.py` — not started
+- [x] `src/medusa.py` — `MedusaModel.__init__` DONE: backbone stored + frozen + heads in `nn.ModuleList` + **init trick complete** (W1 weight+bias zeroed with `is not None` guards, W2 = LM-head clone, W2 bias zeroed). Used `.data.zero_()` / `.data.copy_()` — equivalent to `nn.init.zeros_`.
+- [x] `src/medusa.py` — `MedusaModel.forward` DONE (output_hidden_states → h = hidden_states[-1] → run all heads → return list; + dtype-cast of h to head dtype for mixed precision)
+- [x] Training script `scripts/train_medusa.py` — DONE + validated on 1B (loss 26.5 → 0.063, 100 epochs on 5 medical paragraphs)
 - [x] I can explain: what a Medusa head is, why it's attached to the base model, what SiLU does
 
 **What I learned today (all captured in CONCEPTS.md):**
@@ -280,47 +281,75 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 - PyTorch mechanics: nn.Module (init declares weighted parts, forward = the math; CALL `head(h)` not `head.forward(h)`); nn.Linear is CALLED not multiplied (`W1(h)`, not `W1*h`); nn.ModuleList (a plain list would hide the heads from PyTorch); `requires_grad=False` to freeze.
 
 **MedusaModel progress so far (`src/medusa.py`):**
-- `__init__(self, backbone, num_heads)`: stores backbone; freezes it (`for p in backbone.parameters(): p.requires_grad = False`); creates `num_heads` MedusaHeads in an `nn.ModuleList`, sized from `backbone.config.hidden_size` / `vocab_size`.
-- STILL TO DO in __init__ — the **init trick**, in two halves:
-  - half 1 (NEXT): for each head, `nn.init.zeros_(head.W1.weight)` AND `nn.init.zeros_(head.W1.bias)` — bias too, so the SiLU branch is exactly 0.
-  - half 2: `head.W2.weight.data.copy_(self.backbone.lm_head.weight.data)` and `nn.init.zeros_(head.W2.bias)` — so `W2·h` exactly matches the bias-free LM head.
+- `__init__(self, backbone, num_heads)`: stores backbone; freezes it; creates `num_heads` MedusaHeads in an `nn.ModuleList`, sized from `backbone.config.hidden_size` / `vocab_size`.
+- **init trick DONE** — for each head: `head.W1.weight.data.zero_()` + guarded `head.W1.bias.data.zero_()` (half 1: kills the SiLU branch so the bracket reduces to `h`), then `head.W2.weight.data.copy_(lm_head.weight.data)` + guarded `head.W2.bias.data.zero_()` (half 2: `W2` alone reproduces the LM head). Both biases guarded with `if ... is not None`.
+- Result: each head is BORN as an exact clone of the LM head. Verified by algebra only — queue a runtime sanity check for later: a fresh head's output on a sample `h` should equal `lm_head(h)`.
 - THEN `MedusaModel.forward`: run backbone with `output_hidden_states=True` to get `h`, feed `h` to every head, return the K predictions.
 
 **Blockers / Questions:**
-- None. GPUs free this session.
-- Owed explain-back: "why can't the heads live in a plain Python list?" (PyTorch only tracks modules in proper attributes / nn.ModuleList; a plain list hides their params from `.parameters()`, `.to(device)`, and the optimizer).
+- None.
+- **RESOLVED this session** — the Day 6 "fuzzy concept" the user flagged last time was **`nn.ModuleList` vs a plain list**. Cleared up and explained back: a plain Python list isn't an `nn.Module`, so PyTorch never registers the heads inside it → they're absent from `.parameters()` (optimizer never receives them → never trains), `.to(device)` (device mismatch crash), and `state_dict()` (can't save). `nn.ModuleList` registers each head as a real submodule. (Memory note deleted.)
+- Also explained back: the init-trick bias point — zeroing only `W1.weight` leaves `W1(h) = bias ≠ 0`, so `SiLU(bias) ≠ 0` and the head would NOT start as the LM head.
 
-**Starting Point for Next Session (Day 6 continued):**
+**Session 2026-06-17 (Day 6 FINISHED + Day 7 started):**
+- Finished `MedusaModel.forward` (fixed indentation, filled the 4 placeholders by hand). Explained back: heads eat `hidden_states[-1]` not `logits` because logits are a lossy projection at ONE position; heads aim at DIFFERENT future positions, so they need the full `h`.
+- **Init trick proven at runtime** — `scripts/sanity_medusa.py` printed `Init trick holds: True` (head(h) == lm_head(h)). Learned `torch.allclose` and why `==` fails on floats (same value via different computation paths rounds differently); loosened tolerance to 1e-3 for float16.
+- **Built `scripts/train_medusa.py` from scratch** (every line, mostly by hand): the target SHIFT (drop last `shift` logits, first `shift` labels), weighted CE `λk=0.8^k`, optimizer over `medusa.heads.parameters()` only, the `zero_grad→backward→step` heartbeat, `.item()`, `state_dict`, `torch.save`. Toy data = 5 medical paragraphs (overfit test).
+- **Hit + fixed the float16 NaN** — fp16's narrow range (max ~65k, min ~6e-5) overflows the 128k-vocab softmax / underflows gradients → Adam's divide → NaN from epoch 0. Fix: train heads in **float32**, keep backbone float16, cast `h` to head dtype in `forward`. (Full mechanism now in INTERVIEW_PREP.md §3.11.)
+- **Validation run succeeded:** loss **26.49 → 0.063** over 100 epochs — proves the whole pipeline (forward, shift, weighted CE, backward, step) is correct.
+- **Documentation:** built `INTERVIEW_PREP.md` (private, in `.gitignore`) — full Days 1–6 interview-defense deep-dive. Markdown is the master; LaTeX-on-demand for an Overleaf PDF. (TODO: top up CONCEPTS.md with today's concepts.)
+- **Day 7 started:** wrote `medusa_decode()` (correctness-first, greedy verification, **no KV cache yet**). I generated it because the user asked; user understands it **"not fully"** → explain-back OWED before moving on.
 
-> ⚠️ FIRST, before any code: the user said at the end of this session that **something from Day 6 felt fuzzy** but was too sleepy to name it, and asked to be reminded. Ask: *"You said something from Day 6 felt fuzzy — what was it? Let's clear it up."* (Likely candidates: SiLU, the residual `+ h`, the init trick, freezing, `nn.ModuleList`, or what `h` is.)
-
-1. ssh → passpoli, `source ~/specdecode/venv/bin/activate`, `cd ~/specdecode`, `git pull origin main`
-2. Finish the **init trick** in `MedusaModel.__init__` (half 1 then half 2 — see "MedusaModel progress" above). New tool: `nn.init.zeros_` (in-place; trailing `_` = modify in place).
-3. Write **`MedusaModel.forward`**: get `h` via `output_hidden_states=True`, feed it to each head, return K predictions.
-4. Then start **`scripts/train_medusa.py`** — the training loop. Loss from CONCEPTS.md / paper eq. 1: per-head cross-entropy, weighted by `λk = 0.8^k`.
-5. Remember the WHY: Medusa exists to kill the `0.40 × K` draft tax from Day 5 — the heads ride the target's own forward pass instead of a separate model run K times.
+**Compute plan locked (for the real 8B training):**
+- fp8 impossible on A5000 (Ampere has no fp8 HW); fp16 NaNs AND doesn't fit (~33 GB). Must be fp32 heads.
+- Route A (paid, simple): cloud H100/A100-80GB ~₹150–200. RunPod via MasterCard (₹840 min top-up though), OR IndiaAI/E2E via UPI (needs father's Aadhaar OTP → do when he's awake). Hard budget cap ₹300.
+- Route B (free, more engineering): 2× A5000 (48 GB) + 8-bit Adam (bitsandbytes), backbone on GPU0 / heads on GPU1. ₹0, good interview skill.
+- Dataset target: ~10–15k ShareGPT (instruct) examples, 2 epochs.
 
 ---
 
 ### Day 7 — Medusa Decoding and First Complete System Test
 **Goal:** Three-way benchmark: baseline vs SpecDecode vs Medusa.
 
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (2026-06-20) — `medusa_decode()` with persistent KV cache complete and verified correct on 1B. Three-way benchmark pending 8B head training.
 
 **Deliverable:**
-- [ ] `src/medusa.py` — `medusa_decode()` written
+- [x] Explain-back on `medusa_decode()` — passed (2026-06-20)
+- [x] `scripts/test_medusa_decode.py` — runs on A5000, `Outputs match: True`, 1.38 tokens/round
+- [x] `src/medusa.py` — `medusa_decode()` rewritten with persistent KV cache (O(n) per round)
 - [ ] Three-way benchmark table: tokens/sec for all three configurations
 - [ ] Numbers written down in this log
 
-**Benchmark Numbers (fill in):**
+**What was built this session (2026-06-20):**
+- Rewrote `medusa_decode()` from O(n²) to O(n): PRIME step builds starting cache; PROPOSE feeds 1 token; VERIFY feeds K-1 candidates; CACHE UPDATE re-feeds accepted[:-1] to advance cache cleanly.
+- Debugged `DynamicCache` in-place mutation bug (transformers 4.56.2): `past_key_values` is a mutable object — VERIFY was contaminating `full_cache` before CACHE UPDATE could use it. Fix: `snap()` helper creates a fresh `DynamicCache` from `to_legacy_cache()` + `from_legacy_cache()` at each step. Two snapshots per round: `full_cache` (for VERIFY, expendable) and `update_cache` (clean n-token snapshot for CACHE UPDATE).
+- Correctness verified: `Outputs match: True`, acceptance rate 1.38 tokens/round (identical to O(n²) version — confirms cache is correct).
+- Route B training set up: backbone on cuda:0 float16, heads on cuda:1 float32, 8-bit Adam (bitsandbytes). Fixed medusa.py forward to transfer h device+dtype in one line. Fixed train_medusa_8b.py: correct model name, typo, device mismatch in labels_k, save filename.
+- Toy run on 8B (5 paragraphs, 100 epochs) completed: loss 36.1 → 0.09. Pipeline proven.
+- Real training launched: UltraChat 10k, 2 epochs, max_length=512, expandable_segments=True. Running in tmux session `medusa_train` on passpoli as of 2026-06-20 ~20:45 IST.
+- CONCEPTS.md and INTERVIEW_PREP.md fully updated: KV cache fix, DynamicCache bug, 8-bit Adam, multi-GPU placement, compression table.
+
+**Concepts taught and verified today:**
+- 8-bit Adam: what m and v are, why we compress those not parameters, the quantize-what-you-USE rule
+- Multi-GPU device placement: backbone cuda:0, heads cuda:1, h crosses the boundary once per forward pass
+- combined device+dtype transfer: h.to(device=..., dtype=...)
+- tmux: why it's needed for long remote jobs, Ctrl+B D to detach, tmux attach to resume
+- .pt files: binary pickle, not for GitHub, belongs on HuggingFace Hub
+
+**Benchmark Numbers (fill in after 8B training):**
 | Config | Draft | Target | tok/s | Notes |
 |---|---|---|---|---|
-| Baseline | — | Llama 8B | | |
-| SpecDecode-Small | Llama 1B | Llama 8B | | |
-| Medusa 4-head | 4 heads | Llama 8B | | |
+| Baseline | — | Llama 8B | 38.0 | measured Day 5 |
+| SpecDecode-Small | Llama 1B | Llama 8B | 44.4 | K=4, instruct draft |
+| Medusa 4-head | 4 heads | Llama 8B | TBD | needs 8B head training |
 
-**Starting Point for Next Session:**
-*(fill in)*
+**Starting Point for Next Session (Day 7 finish → Day 8):**
+1. SSH into passpoli → `tmux attach -t medusa_train` → check training completed and `medusa_heads_8b.pt` saved in `~/specdecode/`
+2. If training crashed overnight: check error, fix, rerun. Most likely OOM — drop max_length to 256 if needed.
+3. If training succeeded: write `scripts/benchmark_medusa.py` — load 8B + heads, run medusa_decode on 5 prompts, measure tok/s. Compare against 38.0 (baseline) and 44.4 (SpecDecode). Fill the benchmark table above.
+4. Update checklist item: "What a Medusa head is and how it differs from a separate draft model"
+5. After benchmark numbers are in: move to Day 8 — FastAPI server and streaming.
+6. Push all changes to GitHub: `git add src/medusa.py scripts/train_medusa_8b.py CONCEPTS.md INTERVIEW_PREP.md DAILY_LOG.md`
 
 ---
 
