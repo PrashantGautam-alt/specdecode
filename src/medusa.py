@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import DynamicCache
 
+
 class MedusaHead(nn.Module):
     def __init__(self, hidden_dim, vocab_size):
         super().__init__()
@@ -57,7 +58,7 @@ class MedusaModel(nn.Module):
         h = outputs.hidden_states[-1]
         # Backbone runs in float16, but the heads may be float32 (training needs the
         # wider range to avoid NaNs). Cast h to the heads' dtype so head(h) agrees.
-        h = h.to(self.heads[0].W1.weight.dtype)
+        h = h.to(device=self.heads[0].W1.weight.device, dtype=self.heads[0].W1.weight.dtype)
 
         # Step 3: run EVERY head on the SAME h, collect each head's logits
         head_logits = []
