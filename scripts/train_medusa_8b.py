@@ -41,6 +41,7 @@ if __name__ == "__main__":
                 shift = k+1
                 logits_k = head_logits[k][:, :-shift, :]
                 labels_k = input_ids[:, shift:]
+                labels_k = input_ids[:, shift:].to(logits_k.device)`
                 loss_k = F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), labels_k.reshape(-1))
                 loss = loss + (0.8**k)*loss_k
 
