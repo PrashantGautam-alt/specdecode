@@ -343,13 +343,17 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 | SpecDecode-Small | Llama 1B | Llama 8B | 44.4 | K=4, instruct draft |
 | Medusa 4-head | 4 heads | Llama 8B | TBD | needs 8B head training |
 
+**Training runs completed / in progress:**
+- Run 1 (10k examples, 2 epochs, DONE): epoch 0: 55.4905, epoch 1: 48.0302. Saved as `medusa_heads_8b_10k.pt`.
+- Run 2 (25k examples, 2 epochs, IN PROGRESS as of 2026-06-21 morning): tmux session `medusa_train2` on passpoli. Per-epoch checkpoints: `medusa_heads_8b_epoch0.pt` and `medusa_heads_8b_epoch1.pt`. ETA ~25 hours. Command: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. python scripts/train_medusa_8b.py`
+
 **Starting Point for Next Session (Day 7 finish → Day 8):**
-1. SSH into passpoli → `tmux attach -t medusa_train` → check training completed and `medusa_heads_8b.pt` saved in `~/specdecode/`
-2. If training crashed overnight: check error, fix, rerun. Most likely OOM — drop max_length to 256 if needed.
-3. If training succeeded: write `scripts/benchmark_medusa.py` — load 8B + heads, run medusa_decode on 5 prompts, measure tok/s. Compare against 38.0 (baseline) and 44.4 (SpecDecode). Fill the benchmark table above.
-4. Update checklist item: "What a Medusa head is and how it differs from a separate draft model"
-5. After benchmark numbers are in: move to Day 8 — FastAPI server and streaming.
-6. Push all changes to GitHub: `git add src/medusa.py scripts/train_medusa_8b.py CONCEPTS.md INTERVIEW_PREP.md DAILY_LOG.md`
+1. SSH into passpoli → `tmux attach -t medusa_train2` → check if epoch 0 and epoch 1 printed and checkpoints saved
+2. If training crashed: check error. Most likely OOM → drop max_length to 256. Restart in new tmux session.
+3. If training succeeded: use `medusa_heads_8b_epoch1.pt` (best checkpoint) for benchmarking
+4. Write `scripts/benchmark_medusa.py` — load 8B + heads, run medusa_decode on 5 prompts, measure tok/s. Compare against 38.0 (baseline) and 44.4 (SpecDecode). Fill the benchmark table.
+5. Update checklist: "What a Medusa head is and how it differs from a separate draft model"
+6. After benchmark: move to Day 8 — FastAPI server and streaming.
 
 ---
 
