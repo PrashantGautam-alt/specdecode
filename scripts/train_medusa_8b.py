@@ -5,7 +5,13 @@ from src.medusa import MedusaModel
 import bitsandbytes as bnb
 from datasets import load_dataset
 from transformers import get_linear_schedule_with_warmup
+import os
 
+
+# Set START_EPOCH to the first epoch that has NOT been completed yet.
+# If medusa_heads_8b_epoch0.pt exists, epoch 0 is done → set START_EPOCH = 1.
+START_EPOCH = 1
+CHECKPOINT = "medusa_heads_8b_epoch0.pt"
 
 
 if __name__ == "__main__":
@@ -15,6 +21,11 @@ if __name__ == "__main__":
     tokenizer = loader.tokenizer
     medusa = MedusaModel(backbone, num_heads=4)
     medusa.heads.to(device="cuda:1")  # heads stay float32 for stable training; backbone is already float16
+
+    if START_EPOCH > 0 and os.path.exists(CHECKPOINT):
+        medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:1"))
+        print(f"Resumed from {CHECKPOINT}, starting at epoch {START_EPOCH}")
+
     optimizer = bnb.optim.Adam8bit(medusa.heads.parameters(), lr=2e-5)
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:25000]")
@@ -23,13 +34,17 @@ if __name__ == "__main__":
     total_steps = epochs * len(ds)
     warmup_steps = 500  # lr ramps from 0 to 2e-5 over first 500 steps, then decays
 
+    # last_epoch tells the scheduler how many steps have already been taken,
+    # so the LR picks up at the right point in the decay curve instead of restarting.
+    completed_steps = START_EPOCH * len(ds)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
+        num_training_steps=total_steps,
+        last_epoch=completed_steps - 1,
     )
 
-    for epoch in range(epochs):
+    for epoch in range(START_EPOCH, epochs):
         epoch_loss = 0.0
         for example in ds:
             message = example["messages"]
