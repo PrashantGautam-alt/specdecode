@@ -37,6 +37,10 @@ if __name__ == "__main__":
     # last_epoch tells the scheduler how many steps have already been taken,
     # so the LR picks up at the right point in the decay curve instead of restarting.
     completed_steps = START_EPOCH * len(ds)
+    # The scheduler normally writes initial_lr into param_groups on fresh init (last_epoch=-1).
+    # When resuming without a saved optimizer state, we must inject it ourselves.
+    for group in optimizer.param_groups:
+        group['initial_lr'] = group['lr']
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
