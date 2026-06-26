@@ -282,10 +282,18 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
         num_nodes = len(tokens)
         context_len = generated.shape[1]  # includes the last token processed in PROPOSE
 
-        # build full attention mask: [1, num_nodes, context_len + num_nodes]
+        # build 4D additive attention mask: [1, 1, num_nodes, context_len + num_nodes]
+        # transformers LLaMA expects a 4D float mask (0.0 = attend, -inf = block)
+        # when past_key_values is used with a custom per-position mask.
+        # a 3D bool mask causes CUBLAS errors in transformers 4.44+.
         context_part = torch.ones(num_nodes, context_len, dtype=torch.bool, device=device)
         tree_part = tree_mask.to(device)
-        full_mask = torch.cat([context_part, tree_part], dim=1).unsqueeze(0)
+        bool_mask = torch.cat([context_part, tree_part], dim=1).unsqueeze(0).unsqueeze(0)
+        full_mask = torch.where(
+            bool_mask,
+            torch.zeros(bool_mask.shape, dtype=torch.float16, device=device),
+            torch.full(bool_mask.shape, float('-inf'), dtype=torch.float16, device=device),
+        )
 
         node_tensor = torch.tensor([tokens], device=device, dtype=torch.long)
         with torch.no_grad():
