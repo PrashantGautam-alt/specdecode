@@ -4,6 +4,16 @@ from transformers import DynamicCache
 
 
 class MedusaHead(nn.Module):
+    """
+    One Medusa head: a small two-layer MLP that sits parallel to the LM head
+    and predicts a token further in the future than the base model does.
+
+    Formula: W2(SiLU(W1(h)) + h)
+    The residual '+h' means at init (W1=0) the head reduces exactly to the LM head.
+    Each head is initialized this way so training starts from a sane prediction,
+    not random noise.
+    """
+
     def __init__(self, hidden_dim, vocab_size):
         super().__init__()
         self.W1 = nn.Linear(hidden_dim, hidden_dim)
@@ -14,59 +24,62 @@ class MedusaHead(nn.Module):
         return self.W2(self.act(self.W1(h)) + h)
 
 
-class MedusaModel(nn.Module):   
+class MedusaModel(nn.Module):
+    """
+    Wraps a frozen backbone with num_heads Medusa heads.
+
+    The backbone is never updated. The heads train on top of its hidden states
+    to predict tokens at positions t+2, t+3, ... t+num_heads+1.
+    At inference, one backbone pass produces the hidden state h, and all heads
+    run on that same h in parallel to propose multiple future tokens at once.
+    """
+
     def __init__(self, backbone, num_heads):
         super().__init__()
 
-        # store the backbone
         self.backbone = backbone
-        # freeze it
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        hidden_dim = self.backbone.config.hidden_size   # 4096 for the 8B, 2048 for the 1B
-        vocab_size = self.backbone.config.vocab_size     # 128256
+        hidden_dim = self.backbone.config.hidden_size
+        vocab_size = self.backbone.config.vocab_size
 
         self.heads = nn.ModuleList(
-            [
-                MedusaHead(hidden_dim, vocab_size)
-                for _ in range(num_heads)
-            ]
+            [MedusaHead(hidden_dim, vocab_size) for _ in range(num_heads)]
         )
 
         lm_head = backbone.lm_head
 
         for head in self.heads:
-            # Half 1: zero W1 so its SiLU branch collapses to nothing.
-            # W1(h) = 0  ->  SiLU(0) = 0, leaving just the residual h in the bracket.
-            # The bias must go too, or W1(h) = bias != 0 and the branch survives.
+            # Zero W1 so the SiLU branch vanishes: SiLU(W1*h) = SiLU(0) = 0.
+            # With '+h' surviving, W2*h then needs to equal lm_head(h).
+            # Zeroing the bias too, otherwise W1(h) = bias != 0 and the branch survives.
             head.W1.weight.data.zero_()
             if head.W1.bias is not None:
                 head.W1.bias.data.zero_()
-            # Half 2: the bracket is now exactly h, so W2 alone must reproduce the
-            # LM head. Copy its weight; zero our bias since the LM head carries none.
+            # Copy the LM head weights into W2 so the head starts as an exact clone.
             head.W2.weight.data.copy_(lm_head.weight.data)
             if head.W2.bias is not None:
                 head.W2.bias.data.zero_()
-        
-    def forward(self, input_ids, attention_mask=None):
-        # Step 1: one backbone pass, asking it to also return hidden states
-        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True,)
-        
 
-        # Step 2: pull out the final-layer hidden state h
+    def forward(self, input_ids, attention_mask=None):
+        """
+        One backbone pass with hidden states exposed, then all heads run on h.
+
+        Returns a list of K tensors, each shape [batch, seq_len, vocab_size].
+        Head k predicts the token at position t+k+1.
+        """
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+
         h = outputs.hidden_states[-1]
-        # Backbone runs in float16, but the heads may be float32 (training needs the
-        # wider range to avoid NaNs). Cast h to the heads' dtype so head(h) agrees.
+        # backbone is float16, heads may be float32 (needed to avoid NaN during training)
         h = h.to(device=self.heads[0].W1.weight.device, dtype=self.heads[0].W1.weight.dtype)
 
-        # Step 3: run EVERY head on the SAME h, collect each head's logits
-        head_logits = []
-        for head in self.heads:
-            head_logits.append(head(h))
-
-        # Step 4: return the K predictions
-        return head_logits
+        return [head(h) for head in self.heads]
 
 def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=False):
     """

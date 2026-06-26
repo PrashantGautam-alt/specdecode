@@ -1,7 +1,8 @@
+import json
+import torch
 from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
 from typing import Optional
-import torch
 
 app = FastAPI()
 
@@ -37,7 +38,6 @@ async def stream(websocket: WebSocket):
         generated = torch.cat([generated,torch.tensor([[next_token]], device = backbone.device)], dim=1)
         token_text = tokenizer.decode([next_token], skip_special_tokens=True)
         # send JSON so the frontend can color tokens (accepted=None means naive, no color)
-        import json
         await websocket.send_text(json.dumps({"text": token_text, "accepted": None}))
         if next_token == tokenizer.eos_token_id:
             break
