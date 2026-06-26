@@ -10,8 +10,8 @@ import os
 
 # Set START_EPOCH to the first epoch that has NOT been completed yet.
 # If medusa_heads_8b_epoch0.pt exists, epoch 0 is done → set START_EPOCH = 1.
-START_EPOCH = 1
-CHECKPOINT = "medusa_heads_8b_epoch0.pt"
+START_EPOCH = 2
+CHECKPOINT = "medusa_heads_8b_epoch1.pt"
 
 
 if __name__ == "__main__":
@@ -30,7 +30,7 @@ if __name__ == "__main__":
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:25000]")
 
-    epochs = 2
+    epochs = 4
     total_steps = epochs * len(ds)
     warmup_steps = 500  # lr ramps from 0 to 2e-5 over first 500 steps, then decays
 
