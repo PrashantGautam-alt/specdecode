@@ -26,14 +26,14 @@ Hardware: 2x NVIDIA RTX A5000 (24GB each), CUDA 12.4
 Target model: Llama-3.1-8B-Instruct
 Draft model: Llama-3.2-1B-Instruct
 
-| Config | tok/s | Speedup |
-|---|---|---|
-| Naive 8B baseline | 37.9 | 1.00x |
-| SpecDecode K=4 (1B draft) | 44.4 | 1.17x |
-| Medusa 4-head greedy | 26.4 | 0.69x |
-| Medusa 4-head tree (width=2) | pending | pending |
+| Config | tok/s | Speedup | notes |
+|---|---|---|---|
+| Naive 8B baseline | 37.9 | 1.00x | |
+| SpecDecode K=4 (1B draft) | 44.4 | 1.17x | 1B draft, instruct |
+| Medusa greedy (3-pass) | 24.6 | 0.65x | epoch 1 heads |
+| Medusa tree (width=2) | 25.4 | 0.67x | epoch 1 heads, 2.66 tok/round |
 
-Medusa greedy is slower than naive because our implementation does 3 backbone passes per round (propose + verify + cache update). Tree attention collapses those into one. Benchmark pending on restored server.
+Medusa is slower than naive at epoch 1 because the heads are not yet well-trained (2.66/5 tokens accepted per round on average). The tree is marginally faster than greedy Medusa because it verifies 30 candidates in one pass instead of three sequential passes. With more training epochs the acceptance rate rises and both should cross above naive.
 
 ---
 
