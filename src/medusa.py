@@ -329,11 +329,16 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             layer.self_attn.register_forward_pre_hook(_inject, with_kwargs=True)
             for layer in medusa.backbone.model.layers
         ]
+        # DynamicCache mutates in place: the verify pass appends the 30 tree nodes into
+        # whatever cache we pass. Give it a fresh snapshot so propose_cache stays clean
+        # (context_len tokens) for the m==1 case in Phase 5. Without this, the next round
+        # reuses a cache polluted with 30 phantom nodes → mask/KV length mismatch.
+        verify_input_cache = snap(propose_cache)
         try:
             with torch.no_grad():
                 verify_out = medusa.backbone(
                     input_ids=node_tensor,
-                    past_key_values=propose_cache,
+                    past_key_values=verify_input_cache,
                     position_ids=tree_pos_ids,
                     use_cache=True,
                 )
