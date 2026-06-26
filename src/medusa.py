@@ -314,26 +314,32 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             [context_len + d for d in node_depths], device=device
         ).unsqueeze(0)  # [1, num_nodes]
 
-        # class-level patch: modifies LlamaModel.__dict__ directly, which Python's MRO
-        # finds before the instance dict. instance-level patching is unreliable with
-        # nn.Module because its custom __setattr__ may store attributes in a way
-        # that Python's method resolution doesn't find before the class method.
-        LlamaModelClass = type(medusa.backbone.model)
-        _orig_causal_mask = getattr(LlamaModelClass, '_update_causal_mask', None)
-        if _orig_causal_mask is not None:
-            LlamaModelClass._update_causal_mask = lambda self, attn, *a, **k: attn
+        # use forward_pre_hook on every attention layer to inject our tree mask directly.
+        # this bypasses all of transformers' internal mask building (_update_causal_mask,
+        # sdpa slicing, etc.) regardless of transformers version.
+        # the hook runs just before LlamaAttention.forward, after which the KV cache update
+        # happens inside forward so key_states.shape[-2] = context_len + num_nodes = correct.
+        _captured_mask = full_mask  # closed over by the hook below
+
+        def _inject(module, args, kwargs):
+            kwargs['attention_mask'] = _captured_mask
+            return args, kwargs
+
+        hooks = [
+            layer.self_attn.register_forward_pre_hook(_inject, with_kwargs=True)
+            for layer in medusa.backbone.model.layers
+        ]
         try:
             with torch.no_grad():
                 verify_out = medusa.backbone(
                     input_ids=node_tensor,
                     past_key_values=propose_cache,
-                    attention_mask=full_mask,
                     position_ids=tree_pos_ids,
                     use_cache=True,
                 )
         finally:
-            if _orig_causal_mask is not None:
-                LlamaModelClass._update_causal_mask = _orig_causal_mask
+            for h in hooks:
+                h.remove()
 
         verify_cache = snap(verify_out.past_key_values)
         verify_logits = verify_out.logits[0]  # [num_nodes, vocab_size]
