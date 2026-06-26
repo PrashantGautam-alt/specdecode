@@ -8,7 +8,7 @@ Implements three inference strategies on Llama models, measures the speedup, and
 ---
 
 ![Architecture](assets/architecture.png)
-*Shown with 3 Medusa heads for clarity. Implementation uses K=4.*
+*Implementation uses K=4.*
 
 ---
 
