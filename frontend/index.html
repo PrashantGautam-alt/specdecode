@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SpecDecode</title>
+    <style>
+        body {
+            background: #0d0d0d;
+            color: white;
+            font-family: monospace;
+            max-width: 800px;
+            margin: 60px auto;
+            padding: 0 20px;
+        }
+        h1 { color: #4361ee; margin-bottom: 4px; }
+        p.subtitle { color: #888; margin-top: 0; margin-bottom: 24px; font-size: 13px; }
+        textarea {
+            width: 100%;
+            height: 100px;
+            background: #1a1a1a;
+            color: white;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 14px;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+        button {
+            margin-top: 10px;
+            padding: 10px 28px;
+            background: #4361ee;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        button:hover { background: #3451d1; }
+        #output {
+            margin-top: 28px;
+            min-height: 120px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 14px;
+            font-size: 15px;
+            line-height: 1.8;
+            word-wrap: break-word;
+        }
+        #stats {
+            margin-top: 12px;
+            font-size: 13px;
+            color: #888;
+            display: flex;
+            gap: 24px;
+        }
+        #stats span { color: white; }
+    </style>
+</head>
+<body>
+    <h1>SpecDecode</h1>
+    <p class="subtitle">Speculative decoding inference accelerator — live token visualization</p>
+
+    <!-- 1. Prompt input -->
+    <textarea id="prompt" placeholder="Enter your prompt here..."></textarea>
+
+    <!-- 2. Submit button -->
+    <br>
+    <button onclick="startGeneration()">Generate</button>
+
+    <!-- 3. Token display area -->
+    <div id="output"></div>
+
+    <!-- 4. Stats bar -->
+    <div id="stats">
+        <div>Tokens/sec: <span id="tps">—</span></div>
+        <div>Acceptance rate: <span id="acceptance">—</span></div>
+        <div>Tokens generated: <span id="count">—</span></div>
+    </div>
+
+    <script>
+        let startTime = null;
+        let tokenCount = 0;
+
+        function startGeneration() {
+            const prompt = document.getElementById("prompt").value.trim();
+            if (!prompt) return;
+
+            // clear previous output and stats
+            document.getElementById("output").innerHTML = "";
+            document.getElementById("tps").textContent = "—";
+            document.getElementById("acceptance").textContent = "—";
+            document.getElementById("count").textContent = "0";
+            tokenCount = 0;
+            startTime = null;
+
+            const ws = new WebSocket("ws://localhost:8000/stream");
+
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ prompt: prompt, max_new_tokens: 100 }));
+                startTime = performance.now();
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                tokenCount++;
+
+                // server sends {text, accepted} per token
+                // accepted=true → #4361ee, accepted=false → #780000, null → white (naive)
+                const span = document.createElement("span");
+                span.textContent = data.text;
+                if (data.accepted === true)       span.style.color = "#4361ee";
+                else if (data.accepted === false)  span.style.color = "#780000";
+                // else white (default)
+
+                document.getElementById("output").appendChild(span);
+
+                // update stats
+                const elapsed = (performance.now() - startTime) / 1000;
+                document.getElementById("tps").textContent = (tokenCount / elapsed).toFixed(1);
+                document.getElementById("count").textContent = tokenCount;
+            };
+
+            ws.onclose = () => {
+                // final stats update when stream ends
+                const elapsed = (performance.now() - startTime) / 1000;
+                document.getElementById("tps").textContent = (tokenCount / elapsed).toFixed(1);
+            };
+
+            ws.onerror = (err) => {
+                document.getElementById("output").textContent = "Connection error — is the server running?";
+            };
+        }
+    </script>
+</body>
+</html>
