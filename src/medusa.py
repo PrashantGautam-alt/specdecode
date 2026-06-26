@@ -282,41 +282,27 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
         tree_mask = build_tree_mask(parent_indices=parent_indices)
 
         # PHASE 3 — TREE VERIFY
-        # transformers _update_causal_mask in 4.44+ overwrites any 4D custom mask we pass
-        # when past_key_values is active, replacing it with a [1,1,q,past_len] default.
-        # fix: run a full-sequence forward (context + tree nodes) with no past_key_values.
-        # transformers handles full-sequence passes predictably and uses our 4D mask as-is.
+        # we want past_key_values (reuse context KV) + custom 4D tree mask.
+        # transformers _update_causal_mask overwrites custom masks when past_key_values is active.
+        # fix: temporarily replace _update_causal_mask with a passthrough for this call only.
         num_nodes = len(tokens)
         context_len = generated.shape[1]
         node_tensor = torch.tensor([tokens], device=device, dtype=torch.long)
-        full_input = torch.cat([generated, node_tensor], dim=1)  # [1, context_len + num_nodes]
-        total_len = context_len + num_nodes
 
-        # 4D additive mask [1, 1, total_len, total_len]: 0.0 = attend, -inf = block
-        attn_mask = torch.full(
-            (1, 1, total_len, total_len), float('-inf'), dtype=torch.float16, device=device
+        # 4D additive mask [1, 1, num_nodes, context_len + num_nodes]
+        full_mask = torch.full(
+            (1, 1, num_nodes, context_len + num_nodes), float('-inf'), dtype=torch.float16, device=device
         )
-        # context rows: standard lower-triangular causal
-        ctx_causal = torch.tril(torch.ones(context_len, context_len, dtype=torch.bool, device=device))
-        attn_mask[0, 0, :context_len, :context_len] = torch.where(
-            ctx_causal,
-            torch.zeros_like(ctx_causal, dtype=torch.float16),
-            torch.full_like(ctx_causal, float('-inf'), dtype=torch.float16),
-        )
-        # tree rows: all tree nodes see all context
-        attn_mask[0, 0, context_len:, :context_len] = 0.0
-        # tree rows: tree-to-tree follows ancestor mask
+        full_mask[:, :, :, :context_len] = 0.0  # all tree nodes attend to all context
         tree_allow = tree_mask.to(device)
-        attn_mask[0, 0, context_len:, context_len:] = torch.where(
+        full_mask[0, 0, :, context_len:] = torch.where(
             tree_allow,
             torch.zeros_like(tree_allow, dtype=torch.float16),
             torch.full_like(tree_allow, float('-inf'), dtype=torch.float16),
         )
 
-        # each tree node's RoPE position must match its depth, not its index in full_input.
-        # depth-1 nodes all represent token t+1 (position context_len),
-        # depth-2 nodes represent t+2 (position context_len+1), etc.
-        # without this, RoPE gives wrong rotations → wrong logits → wrong acceptance decisions.
+        # depth-based position_ids: all nodes at same depth share the same RoPE rotation.
+        # without this, sibling nodes get different positions and produce wrong logits.
         node_depths = []
         for i in range(num_nodes):
             d, node = 0, i
@@ -324,66 +310,82 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
                 node = parent_indices[node]
                 d += 1
             node_depths.append(d)
-        context_pos = torch.arange(context_len, device=device).unsqueeze(0)
-        tree_pos = torch.tensor([context_len + d for d in node_depths], device=device).unsqueeze(0)
-        position_ids = torch.cat([context_pos, tree_pos], dim=1)  # [1, total_len]
+        tree_pos_ids = torch.tensor(
+            [context_len + d for d in node_depths], device=device
+        ).unsqueeze(0)  # [1, num_nodes]
 
-        with torch.no_grad():
-            verify_out = medusa.backbone(
-                input_ids=full_input,
-                attention_mask=attn_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-        verify_logits = verify_out.logits[0, context_len:, :]  # [num_nodes, vocab_size]
-        backbone_preds = verify_logits.argmax(dim=-1).tolist()  # [num_nodes]
+        def _passthrough(self, attention_mask, *args, **kwargs):
+            return attention_mask
+
+        medusa.backbone.model._update_causal_mask = _passthrough.__get__(
+            medusa.backbone.model, type(medusa.backbone.model)
+        )
+        try:
+            with torch.no_grad():
+                verify_out = medusa.backbone(
+                    input_ids=node_tensor,
+                    past_key_values=propose_cache,
+                    attention_mask=full_mask,
+                    position_ids=tree_pos_ids,
+                    use_cache=True,
+                )
+        finally:
+            del medusa.backbone.model._update_causal_mask  # restores class method
+
+        verify_cache = snap(verify_out.past_key_values)
+        verify_logits = verify_out.logits[0]  # [num_nodes, vocab_size]
+        backbone_preds = verify_logits.argmax(dim=-1).tolist()
 
         # PHASE 4 — FIND BEST PATH
-        # leaves are the last width^K nodes
+        # also track best_path_nodes: the tree node indices for accepted tokens.
+        # needed in Phase 5 to extract their KV from verify_cache without a backbone forward.
         leaf_start = num_nodes - width**K
         best_accepted = []
+        best_path_nodes = []
 
         for leaf in range(leaf_start, num_nodes):
-            # trace path from leaf back to root using parent_indices
             path = []
             node = leaf
             while node != -1:
                 path.append(node)
                 node = parent_indices[node]
-            path.reverse()  # now [root_node, ..., leaf_node]
+            path.reverse()
 
-            # walk the path checking backbone agreement
             accepted = [backbone_pred_0]
-            if backbone_pred_0 != tokens[path[0]]:
-                pass  # mismatch at position 0 — keep just [backbone_pred_0]
-            else:
+            path_nodes = []
+
+            if backbone_pred_0 == tokens[path[0]]:
+                path_nodes.append(path[0])
                 for j in range(len(path)):
                     if j + 1 < len(path):
                         accepted.append(backbone_preds[path[j]])
-                        if backbone_preds[path[j]] != tokens[path[j+1]]:
+                        if backbone_preds[path[j]] != tokens[path[j + 1]]:
                             break
+                        path_nodes.append(path[j + 1])
                     else:
                         accepted.append(backbone_preds[path[j]])  # bonus token
 
             if len(accepted) > len(best_accepted):
                 best_accepted = accepted
+                best_path_nodes = path_nodes
 
         if not best_accepted:
             best_accepted = [backbone_pred_0]
+            best_path_nodes = []
 
-        # PHASE 5 — CACHE UPDATE + APPEND
+        # PHASE 5 — CACHE UPDATE via KV extraction (no backbone forward)
+        # accepted tokens at t+1..t+m-1 correspond to tree nodes best_path_nodes[0..m-2].
+        # their KV already exists in verify_cache at positions context_len + node_index.
+        # index them out directly — saves an entire backbone forward pass vs the old approach.
         m = len(best_accepted)
         if m == 1:
             cache = propose_cache
         else:
-            update_input = torch.tensor([best_accepted[:-1]], device=device, dtype=torch.long)
-            with torch.no_grad():
-                update_out = medusa.backbone(
-                    input_ids=update_input,
-                    past_key_values=propose_cache,
-                    use_cache=True,
-                )
-            cache = snap(update_out.past_key_values)
+            kv_idx = list(range(context_len)) + [context_len + n for n in best_path_nodes]
+            idx = torch.tensor(kv_idx, device=device)
+            legacy = verify_cache.to_legacy_cache()
+            trimmed = tuple((kv[0][:, :, idx, :], kv[1][:, :, idx, :]) for kv in legacy)
+            cache = DynamicCache.from_legacy_cache(trimmed)
 
         new_tensor = torch.tensor([best_accepted], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
