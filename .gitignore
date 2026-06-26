@@ -9,3 +9,9 @@ __pycache__/
 # Private interview-defense report — for my eyes only, never publish to GitHub
 INTERVIEW_PREP.md
 INTERVIEW_PREP.tex
+CONCEPTS.md
+DAILY_LOG.md
+ROADMAP.md
+day1_test_models_roadmap.txt
+day4_gpu_fix_notes.txt
+*.pdf
