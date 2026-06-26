@@ -120,7 +120,10 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
         full_cache = snap(propose_out.past_key_values)
         update_cache = snap(full_cache)   # clean n-token snapshot for PHASE 4; full_cache will be mutated by VERIFY
         backbone_pred_0 = propose_out.logits[0, -1, :].argmax().item()
-        h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
+        h = propose_out.hidden_states[-1].to(
+            device=medusa.heads[0].W1.weight.device,
+            dtype=medusa.heads[0].W1.weight.dtype,
+        )
         candidates = [medusa.heads[k](h)[0, -1, :].argmax().item() for k in range(K)]
 
         # PHASE 2 — VERIFY: feed only the K-1 candidates through the backbone using
@@ -310,10 +313,26 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             torch.full_like(tree_allow, float('-inf'), dtype=torch.float16),
         )
 
+        # each tree node's RoPE position must match its depth, not its index in full_input.
+        # depth-1 nodes all represent token t+1 (position context_len),
+        # depth-2 nodes represent t+2 (position context_len+1), etc.
+        # without this, RoPE gives wrong rotations → wrong logits → wrong acceptance decisions.
+        node_depths = []
+        for i in range(num_nodes):
+            d, node = 0, i
+            while parent_indices[node] != -1:
+                node = parent_indices[node]
+                d += 1
+            node_depths.append(d)
+        context_pos = torch.arange(context_len, device=device).unsqueeze(0)
+        tree_pos = torch.tensor([context_len + d for d in node_depths], device=device).unsqueeze(0)
+        position_ids = torch.cat([context_pos, tree_pos], dim=1)  # [1, total_len]
+
         with torch.no_grad():
             verify_out = medusa.backbone(
                 input_ids=full_input,
                 attention_mask=attn_mask,
+                position_ids=position_ids,
                 use_cache=False,
             )
         verify_logits = verify_out.logits[0, context_len:, :]  # [num_nodes, vocab_size]
