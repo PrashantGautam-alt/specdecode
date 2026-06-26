@@ -314,12 +314,14 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             [context_len + d for d in node_depths], device=device
         ).unsqueeze(0)  # [1, num_nodes]
 
-        def _passthrough(self, attention_mask, *args, **kwargs):
-            return attention_mask
-
-        medusa.backbone.model._update_causal_mask = _passthrough.__get__(
-            medusa.backbone.model, type(medusa.backbone.model)
-        )
+        # class-level patch: modifies LlamaModel.__dict__ directly, which Python's MRO
+        # finds before the instance dict. instance-level patching is unreliable with
+        # nn.Module because its custom __setattr__ may store attributes in a way
+        # that Python's method resolution doesn't find before the class method.
+        LlamaModelClass = type(medusa.backbone.model)
+        _orig_causal_mask = getattr(LlamaModelClass, '_update_causal_mask', None)
+        if _orig_causal_mask is not None:
+            LlamaModelClass._update_causal_mask = lambda self, attn, *a, **k: attn
         try:
             with torch.no_grad():
                 verify_out = medusa.backbone(
@@ -330,7 +332,8 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
                     use_cache=True,
                 )
         finally:
-            del medusa.backbone.model._update_causal_mask  # restores class method
+            if _orig_causal_mask is not None:
+                LlamaModelClass._update_causal_mask = _orig_causal_mask
 
         verify_cache = snap(verify_out.past_key_values)
         verify_logits = verify_out.logits[0]  # [num_nodes, vocab_size]
