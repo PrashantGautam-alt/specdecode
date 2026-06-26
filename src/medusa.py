@@ -411,4 +411,189 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
     if verbose:
         print(f"  avg tokens/round: {total_accepted / rounds:.2f} over {rounds} rounds")
     return tokenizer.decode(generated[0], skip_special_tokens=True)
-    
+
+
+def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False):
+    """
+    Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
+
+    The standalone PROPOSE pass existed only to compute a fresh hidden state h for the heads.
+    But the VERIFY pass already produces a hidden state for every node it processes — we were
+    throwing them away. Here we keep them: the hidden state at this round's last matched node
+    is exactly what the heads need to build the NEXT round's tree.
+
+    Each round feeds [bonus_token] ++ [tree_nodes] in a single pass:
+      - the prepended bonus token (last round's guaranteed token) gets its KV computed here,
+        and its LM logits give backbone_pred_0 (the true next token) for free
+      - the tree nodes get verified against backbone_pred_0 and each other
+
+    Because head 0 predicts t+1 (the same token the LM head gives), it is redundant with the
+    prepended bonus. So the tree is built from heads 1..K-1 → depth K-1 instead of K. We trade
+    one tree level for eliminating a whole backbone pass — a good deal on a memory-bound model.
+
+    Invariant held at the top of each round:
+      - generated   = all committed tokens [0..P-1]
+      - cache       = KV for exactly those committed tokens
+      - pending     = the guaranteed token at position P (NOT yet in generated or cache)
+      - seed_h      = hidden state at position P-1 (predicts pending via head 0, the tree via 1..K-1)
+    """
+    device = next(medusa.backbone.parameters()).device
+    head_device = medusa.heads[0].W1.weight.device
+    head_dtype = medusa.heads[0].W1.weight.dtype
+    tree_depth = K - 1  # head 0 is spent on the prepended bonus; heads 1..K-1 build the tree
+
+    def snap(kv):
+        legacy = kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
+        return DynamicCache.from_legacy_cache(legacy)
+
+    generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    start_len = generated.shape[1]
+    total_new = 0
+    rounds = 0
+
+    # COLD START — one ordinary forward over the prompt to bootstrap the invariant.
+    # cache holds all prompt tokens; pending is the first generated token; seed_h is the
+    # hidden state at the last prompt token (which predicts pending and seeds the first tree).
+    with torch.no_grad():
+        cold = medusa.backbone(input_ids=generated, use_cache=True, output_hidden_states=True)
+    cache = snap(cold.past_key_values)
+    seed_h = cold.hidden_states[-1][0, -1, :].to(device=head_device, dtype=head_dtype)
+    pending = cold.logits[0, -1, :].argmax().item()
+
+    while generated.shape[1] < start_len + max_new_tokens:
+        context_len = generated.shape[1]  # cache length = number of committed tokens
+
+        # BUILD TREE from seed_h using heads 1..K-1 (head 0 predicts the already-known pending).
+        head_logits = [medusa.heads[k](seed_h)[:].reshape(-1) for k in range(1, K)]
+        tokens, parent_indices = build_tree_candidates(head_logits=head_logits, width=width)
+        tree_mask = build_tree_mask(parent_indices=parent_indices)
+        num_nodes = len(tokens)
+
+        # FUSED INPUT: [pending] ++ tree_nodes. The prepend sits at index 0 (absolute pos P).
+        seq = [pending] + tokens
+        seq_tensor = torch.tensor([seq], device=device, dtype=torch.long)
+        q_len = 1 + num_nodes
+        kv_len = context_len + 1 + num_nodes
+
+        # node depths (1-based): depth-1 node is a candidate for position P+1.
+        node_depths = []
+        for i in range(num_nodes):
+            d, node = 0, i
+            while parent_indices[node] != -1:
+                node = parent_indices[node]
+                d += 1
+            node_depths.append(d + 1)  # +1 because the prepend occupies the P slot
+
+        # position_ids: prepend at P (=context_len), node at P + its depth.
+        pos_ids = torch.tensor(
+            [context_len] + [context_len + d for d in node_depths], device=device
+        ).unsqueeze(0)
+
+        # 4D additive mask [1, 1, q_len, kv_len].
+        mask = torch.full((1, 1, q_len, kv_len), float('-inf'), dtype=torch.float16, device=device)
+        mask[:, :, :, :context_len] = 0.0       # everyone attends to all committed context
+        mask[:, :, :, context_len] = 0.0        # everyone attends to the prepend (ancestor of all)
+        tree_allow = tree_mask.to(device)
+        mask[0, 0, 1:, context_len + 1:] = torch.where(  # node-to-node follows ancestor mask
+            tree_allow,
+            torch.zeros_like(tree_allow, dtype=torch.float16),
+            torch.full_like(tree_allow, float('-inf'), dtype=torch.float16),
+        )
+
+        _captured = mask
+
+        def _inject(module, args, kwargs):
+            kwargs['attention_mask'] = _captured
+            return args, kwargs
+
+        hooks = [
+            layer.self_attn.register_forward_pre_hook(_inject, with_kwargs=True)
+            for layer in medusa.backbone.model.layers
+        ]
+        verify_input_cache = snap(cache)  # keep `cache` clean; the pass mutates this copy
+        try:
+            with torch.no_grad():
+                out = medusa.backbone(
+                    input_ids=seq_tensor,
+                    past_key_values=verify_input_cache,
+                    position_ids=pos_ids,
+                    output_hidden_states=True,
+                    use_cache=True,
+                )
+        finally:
+            for h in hooks:
+                h.remove()
+
+        out_cache = snap(out.past_key_values)
+        hidden = out.hidden_states[-1]            # [1, q_len, dim], on backbone device
+        backbone_pred_0 = out.logits[0, 0, :].argmax().item()         # true token at P+1
+        backbone_preds = out.logits[0, 1:, :].argmax(dim=-1).tolist()  # prediction after each node
+
+        # FIND BEST PATH — identical accept logic to the non-fused version.
+        leaf_start = num_nodes - width**tree_depth
+        best_accepted = []
+        best_path_nodes = []
+        for leaf in range(leaf_start, num_nodes):
+            path = []
+            node = leaf
+            while node != -1:
+                path.append(node)
+                node = parent_indices[node]
+            path.reverse()
+
+            accepted = [backbone_pred_0]
+            path_nodes = []
+            if backbone_pred_0 == tokens[path[0]]:
+                path_nodes.append(path[0])
+                for j in range(len(path)):
+                    if j + 1 < len(path):
+                        accepted.append(backbone_preds[path[j]])
+                        if backbone_preds[path[j]] != tokens[path[j + 1]]:
+                            break
+                        path_nodes.append(path[j + 1])
+                    else:
+                        accepted.append(backbone_preds[path[j]])  # bonus token
+
+            if len(accepted) > len(best_accepted):
+                best_accepted = accepted
+                best_path_nodes = path_nodes
+
+        if not best_accepted:
+            best_accepted = [backbone_pred_0]
+            best_path_nodes = []
+
+        # COMMIT: the old pending (guaranteed) plus every tree token EXCEPT the new bonus.
+        # the new bonus becomes next round's pending (KV deliberately left out of the cache).
+        new_bonus = best_accepted[-1]
+        committed_this_round = [pending] + best_accepted[:-1]
+        new_tensor = torch.tensor([committed_this_round], device=device, dtype=torch.long)
+        generated = torch.cat([generated, new_tensor], dim=1)
+
+        # NEW CACHE = context + prepend + matched nodes (excludes the new bonus).
+        kv_idx = list(range(context_len)) + [context_len] + [context_len + 1 + n for n in best_path_nodes]
+        idx = torch.tensor(kv_idx, device=device)
+        legacy = out_cache.to_legacy_cache()
+        trimmed = tuple((kv[0][:, :, idx, :], kv[1][:, :, idx, :]) for kv in legacy)
+        cache = DynamicCache.from_legacy_cache(trimmed)
+
+        # NEW SEED_H = hidden state at the last matched node (or the prepend if nothing matched).
+        # this is what the heads read next round — no PROPOSE pass needed.
+        if best_path_nodes:
+            seed_h = hidden[0, 1 + best_path_nodes[-1], :]
+        else:
+            seed_h = hidden[0, 0, :]
+        seed_h = seed_h.to(device=head_device, dtype=head_dtype)
+        pending = new_bonus
+
+        rounds += 1
+        new_count = len(committed_this_round)
+        total_new += new_count
+        if verbose:
+            print(f"  round {rounds}: {new_count} new tokens")
+
+    # the final pending is committed but was held out of `generated` — append it now.
+    generated = torch.cat([generated, torch.tensor([[pending]], device=device)], dim=1)
+
+    if verbose:
+        print(f"  avg new tokens/round: {total_new / rounds:.2f} over {rounds} rounds")
+    return tokenizer.decode(generated[0], skip_special_tokens=True)

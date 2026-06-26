@@ -1,7 +1,7 @@
 import time
 import torch
 from src.models import ModelLoader
-from src.medusa import MedusaModel, medusa_decode, medusa_decode_tree
+from src.medusa import MedusaModel, medusa_decode, medusa_decode_tree, medusa_decode_tree_fused
 from src.sampler import naive_generate
 
 CHECKPOINT = "medusa_heads_8b_epoch1.pt"
@@ -65,6 +65,17 @@ if __name__ == "__main__":
     else:
         print("PASSED — tree output matches greedy decoding (tree overshot by a few tokens, which is expected).")
 
+    # fused tree (PROPOSE folded into VERIFY, 1 pass/round) must also match greedy.
+    fused_out = medusa_decode_tree_fused(medusa, tokenizer, PROMPT, max_new_tokens=40, K=K, width=WIDTH, verbose=True)
+    f_shorter, f_longer = sorted([greedy_out, fused_out], key=len)
+    fused_match = f_longer.startswith(f_shorter)
+    print(f"\nFused output:  {fused_out}")
+    print(f"Fused matches greedy (prefix): {fused_match}")
+    if not fused_match:
+        print("FUSED MISMATCH — fused tree has a bug, do not trust its benchmark number.")
+    else:
+        print("FUSED PASSED — fused tree output matches greedy decoding.")
+
     # --- Benchmark ---
     print("\nWarming up...")
     naive_generate(backbone, tokenizer, PROMPT, max_new_tokens=10)
@@ -83,6 +94,10 @@ if __name__ == "__main__":
     tree_time = measure(lambda: medusa_decode_tree(medusa, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS, K=K, width=WIDTH))
     tree_tps = MAX_NEW_TOKENS / tree_time
 
+    print("Benchmarking Medusa tree FUSED (1 pass/round)...")
+    fused_time = measure(lambda: medusa_decode_tree_fused(medusa, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS, K=K, width=WIDTH))
+    fused_tps = MAX_NEW_TOKENS / fused_time
+
     print("\nAcceptance rate — tree (verbose pass):")
     medusa_decode_tree(medusa, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS, K=K, width=WIDTH, verbose=True)
 
@@ -93,4 +108,5 @@ if __name__ == "__main__":
     print(f"{'SpecDecode K=4':<32} {SPEC_TPS:>8.1f}  {SPEC_SPEEDUP:>7.2f}x  1B draft, instruct")
     print(f"{'Medusa greedy (3-pass)':<32} {greedy_tps:>8.1f}  {greedy_tps/NAIVE_TPS:>7.2f}x  epoch1")
     print(f"{'Medusa tree (width=2)':<32} {tree_tps:>8.1f}  {tree_tps/NAIVE_TPS:>7.2f}x  epoch1")
+    print(f"{'Medusa tree FUSED (1 pass)':<32} {fused_tps:>8.1f}  {fused_tps/NAIVE_TPS:>7.2f}x  epoch1")
     print(f"{'='*68}")
