@@ -279,32 +279,45 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
         tree_mask = build_tree_mask(parent_indices=parent_indices)
 
         # PHASE 3 — TREE VERIFY
+        # transformers _update_causal_mask in 4.44+ overwrites any 4D custom mask we pass
+        # when past_key_values is active, replacing it with a [1,1,q,past_len] default.
+        # fix: run a full-sequence forward (context + tree nodes) with no past_key_values.
+        # transformers handles full-sequence passes predictably and uses our 4D mask as-is.
         num_nodes = len(tokens)
-        context_len = generated.shape[1]  # includes the last token processed in PROPOSE
+        context_len = generated.shape[1]
+        node_tensor = torch.tensor([tokens], device=device, dtype=torch.long)
+        full_input = torch.cat([generated, node_tensor], dim=1)  # [1, context_len + num_nodes]
+        total_len = context_len + num_nodes
 
-        # build 4D additive attention mask: [1, 1, num_nodes, context_len + num_nodes]
-        # transformers LLaMA expects a 4D float mask (0.0 = attend, -inf = block)
-        # when past_key_values is used with a custom per-position mask.
-        # a 3D bool mask causes CUBLAS errors in transformers 4.44+.
-        context_part = torch.ones(num_nodes, context_len, dtype=torch.bool, device=device)
-        tree_part = tree_mask.to(device)
-        bool_mask = torch.cat([context_part, tree_part], dim=1).unsqueeze(0).unsqueeze(0)
-        full_mask = torch.where(
-            bool_mask,
-            torch.zeros(bool_mask.shape, dtype=torch.float16, device=device),
-            torch.full(bool_mask.shape, float('-inf'), dtype=torch.float16, device=device),
+        # 4D additive mask [1, 1, total_len, total_len]: 0.0 = attend, -inf = block
+        attn_mask = torch.full(
+            (1, 1, total_len, total_len), float('-inf'), dtype=torch.float16, device=device
+        )
+        # context rows: standard lower-triangular causal
+        ctx_causal = torch.tril(torch.ones(context_len, context_len, dtype=torch.bool, device=device))
+        attn_mask[0, 0, :context_len, :context_len] = torch.where(
+            ctx_causal,
+            torch.zeros_like(ctx_causal, dtype=torch.float16),
+            torch.full_like(ctx_causal, float('-inf'), dtype=torch.float16),
+        )
+        # tree rows: all tree nodes see all context
+        attn_mask[0, 0, context_len:, :context_len] = 0.0
+        # tree rows: tree-to-tree follows ancestor mask
+        tree_allow = tree_mask.to(device)
+        attn_mask[0, 0, context_len:, context_len:] = torch.where(
+            tree_allow,
+            torch.zeros_like(tree_allow, dtype=torch.float16),
+            torch.full_like(tree_allow, float('-inf'), dtype=torch.float16),
         )
 
-        node_tensor = torch.tensor([tokens], device=device, dtype=torch.long)
         with torch.no_grad():
             verify_out = medusa.backbone(
-                input_ids=node_tensor,
-                past_key_values=propose_cache,
-                attention_mask=full_mask,
-                use_cache=True,
+                input_ids=full_input,
+                attention_mask=attn_mask,
+                use_cache=False,
             )
-        verify_logits = verify_out.logits[0]  # shape [num_nodes, vocab_size]
-        backbone_preds = verify_logits.argmax(dim=-1).tolist()  # shape [num_nodes]
+        verify_logits = verify_out.logits[0, context_len:, :]  # [num_nodes, vocab_size]
+        backbone_preds = verify_logits.argmax(dim=-1).tolist()  # [num_nodes]
 
         # PHASE 4 — FIND BEST PATH
         # leaves are the last width^K nodes
