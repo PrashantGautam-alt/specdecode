@@ -95,7 +95,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     while generated.shape[1] < start_len + max_new_tokens:
         # PHASE 1 — PROPOSE: process only the last token using the cache (O(1) cost).
         # The backbone returns the hidden state h at that position — the heads read h
-        # to propose K candidates. backbone_preds_0 is what the backbone itself would
+        # to propose K candidates. backbone_pred_0 is what the backbone itself would
         # say next, obtained for free from the same pass.
         with torch.no_grad():
             propose_out = medusa.backbone(
@@ -106,7 +106,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
             )
         full_cache = snap(propose_out.past_key_values)
         update_cache = snap(full_cache)   # clean n-token snapshot for PHASE 4; full_cache will be mutated by VERIFY
-        backbone_preds_0 = propose_out.logits[0, -1, :].argmax().item()
+        backbone_pred_0 = propose_out.logits[0, -1, :].argmax().item()
         h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
         candidates = [medusa.heads[k](h)[0, -1, :].argmax().item() for k in range(K)]
 
@@ -121,7 +121,7 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
                 use_cache=True,
             )
         verify_preds = verify_out.logits[0, :, :].argmax(dim=-1).tolist()
-        backbone_preds = [backbone_preds_0] + verify_preds
+        backbone_preds = [backbone_pred_0] + verify_preds
 
         # PHASE 3 — ACCEPT: walk left to right. We always emit the backbone's token,
         # never the candidate — output stays identical to plain greedy decoding.
@@ -158,3 +158,185 @@ def medusa_decode(medusa, tokenizer, prompt, max_new_tokens=100, K=4, verbose=Fa
     if verbose:
         print(f"  avg tokens/round: {total_accepted / rounds:.2f} over {rounds} rounds")
     return tokenizer.decode(generated[0], skip_special_tokens=True)
+
+def build_tree_candidates(head_logits, width=2):
+    """
+    Build the flat node list for a Cartesian product candidate tree.
+
+    head_logits: list of K tensors, each shape [vocab_size]
+    width:       number of top candidates to keep per head
+
+    Returns:
+        tokens:         list of token IDs, one per node (length = width * (width^K - 1) / (width - 1))
+        parent_indices: list of ints, parent_indices[i] = index of node i's parent in tokens
+                        (-1 for root-level nodes, meaning their parent is the context)
+    """
+    tokens = []
+
+    parent_indices = []
+
+    # level_node_indices tracks the flat indices of all nodes at the CURRENT level
+    # at depth 1, these are indices 0, 1 (the two root nodes)
+    # at depth 2, these are indices 2, 3, 4, 5 (children of the two root nodes)
+    level_node_indices = []
+
+    for depth, logits in enumerate(head_logits):
+        topk_tokens = torch.topk(logits, width).indices.tolist()  # get top-`width` token IDs from this head's logits
+
+        if depth == 0:
+            # no parents yet — root level
+            for tok in topk_tokens:
+                tokens.append(tok)
+                parent_indices.append(-1)
+            level_node_indices = list(range(len(tokens)))  # e.g. [0, 1]
+
+        else:
+            next_level_indices = []
+            for parent_idx in level_node_indices:
+                for tok in topk_tokens:
+                    tokens.append(tok)
+                    parent_indices.append(parent_idx)
+                    next_level_indices.append(len(tokens) - 1)
+            level_node_indices = next_level_indices
+
+    return tokens, parent_indices
+
+
+def build_tree_mask(parent_indices):
+    """
+    Build the boolean attention mask for the candidate tree.
+
+    parent_indices: list of ints from build_tree_candidates
+                    (-1 means root node, no parent)
+
+    Returns:
+        mask: BoolTensor shape [num_nodes, num_nodes]
+              mask[i][j] = True means node i is allowed to attend to node j
+    """
+    n = len(parent_indices)
+    mask = torch.zeros(n, n, dtype=torch.bool)
+
+    for i, parent in enumerate(parent_indices):
+        if parent == -1:
+            # root node — attends only to itself
+            mask[i][i] = True
+        else:
+            # copy everything the parent could see, then add self
+            mask[i] = mask[parent]
+            mask[i][i] = True
+
+    return mask
+
+def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False):
+    device = next(medusa.backbone.parameters()).device
+
+    def snap(kv):
+        legacy = kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
+        return DynamicCache.from_legacy_cache(legacy)
+
+    generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    start_len = generated.shape[1]
+    total_accepted = 0
+    rounds = 0
+
+    with torch.no_grad():
+        prime_out = medusa.backbone(input_ids=generated[:, :-1], use_cache=True)
+    cache = snap(prime_out.past_key_values)
+
+    while generated.shape[1] < start_len + max_new_tokens:
+
+        # PHASE 1 — PROPOSE
+        with torch.no_grad():
+            propose_out = medusa.backbone(
+                input_ids=generated[:, -1:],
+                past_key_values=cache,
+                output_hidden_states=True,
+                use_cache=True,
+            )
+        propose_cache = snap(propose_out.past_key_values)
+        h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
+        head_logits = [medusa.heads[k](h)[0, -1, :] for k in range(K)]
+        backbone_pred_0 = propose_out.logits[0,-1,:].argmax().item()
+
+        # PHASE 2 — BUILD TREE
+        tokens, parent_indices = build_tree_candidates(head_logits=head_logits, width=width)
+        tree_mask = build_tree_mask(parent_indices=parent_indices)
+
+        # PHASE 3 — TREE VERIFY
+        num_nodes = len(tokens)
+        context_len = generated.shape[1]  # includes the last token processed in PROPOSE
+
+        # build full attention mask: [1, num_nodes, context_len + num_nodes]
+        context_part = torch.ones(num_nodes, context_len, dtype=torch.bool, device=device)
+        tree_part = tree_mask.to(device)
+        full_mask = torch.cat([context_part, tree_part], dim=1).unsqueeze(0)
+
+        node_tensor = torch.tensor([tokens], device=device, dtype=torch.long)
+        with torch.no_grad():
+            verify_out = medusa.backbone(
+                input_ids=node_tensor,
+                past_key_values=propose_cache,
+                attention_mask=full_mask,
+                use_cache=True,
+            )
+        verify_logits = verify_out.logits[0]  # shape [num_nodes, vocab_size]
+        backbone_preds = verify_logits.argmax(dim=-1).tolist()  # shape [num_nodes]
+
+        # PHASE 4 — FIND BEST PATH
+        # leaves are the last width^K nodes
+        leaf_start = num_nodes - width**K
+        best_accepted = []
+
+        for leaf in range(leaf_start, num_nodes):
+            # trace path from leaf back to root using parent_indices
+            path = []
+            node = leaf
+            while node != -1:
+                path.append(node)
+                node = parent_indices[node]
+            path.reverse()  # now [root_node, ..., leaf_node]
+
+            # walk the path checking backbone agreement
+            accepted = [backbone_pred_0]
+            if backbone_pred_0 != tokens[path[0]]:
+                pass  # mismatch at position 0 — keep just [backbone_pred_0]
+            else:
+                for j in range(len(path)):
+                    if j + 1 < len(path):
+                        accepted.append(backbone_preds[path[j]])
+                        if backbone_preds[path[j]] != tokens[path[j+1]]:
+                            break
+                    else:
+                        accepted.append(backbone_preds[path[j]])  # bonus token
+
+            if len(accepted) > len(best_accepted):
+                best_accepted = accepted
+
+        if not best_accepted:
+            best_accepted = [backbone_pred_0]
+
+        # PHASE 5 — CACHE UPDATE + APPEND
+        m = len(best_accepted)
+        if m == 1:
+            cache = propose_cache
+        else:
+            update_input = torch.tensor([best_accepted[:-1]], device=device, dtype=torch.long)
+            with torch.no_grad():
+                update_out = medusa.backbone(
+                    input_ids=update_input,
+                    past_key_values=propose_cache,
+                    use_cache=True,
+                )
+            cache = snap(update_out.past_key_values)
+
+        new_tensor = torch.tensor([best_accepted], device=device, dtype=torch.long)
+        generated = torch.cat([generated, new_tensor], dim=1)
+        rounds += 1
+        total_accepted += m
+        if verbose:
+            print(f"  round {rounds}: accepted {m}/{K+1} tokens")
+
+    if verbose:
+        print(f"  avg tokens/round: {total_accepted / rounds:.2f} over {rounds} rounds")
+    return tokenizer.decode(generated[0], skip_special_tokens=True)
+    

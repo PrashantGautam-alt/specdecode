@@ -311,14 +311,14 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 ### Day 7 — Medusa Decoding and First Complete System Test
 **Goal:** Three-way benchmark: baseline vs SpecDecode vs Medusa.
 
-**Status:** IN PROGRESS (2026-06-20) — `medusa_decode()` with persistent KV cache complete and verified correct on 1B. Three-way benchmark pending 8B head training.
+**Status:** DONE (2026-06-25) — three-way benchmark complete. Medusa greedy 0.65x; bottleneck is 3-pass structure, not training quality (acceptance 2.22 tokens/round is healthy). Tree attention (Extension A) is the fix.
 
 **Deliverable:**
 - [x] Explain-back on `medusa_decode()` — passed (2026-06-20)
 - [x] `scripts/test_medusa_decode.py` — runs on A5000, `Outputs match: True`, 1.38 tokens/round
 - [x] `src/medusa.py` — `medusa_decode()` rewritten with persistent KV cache (O(n) per round)
-- [ ] Three-way benchmark table: tokens/sec for all three configurations
-- [ ] Numbers written down in this log
+- [x] Three-way benchmark table: tokens/sec for all three configurations
+- [x] Numbers written down in this log
 
 **What was built this session (2026-06-20):**
 - Rewrote `medusa_decode()` from O(n²) to O(n): PRIME step builds starting cache; PROPOSE feeds 1 token; VERIFY feeds K-1 candidates; CACHE UPDATE re-feeds accepted[:-1] to advance cache cleanly.
@@ -336,24 +336,59 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 - tmux: why it's needed for long remote jobs, Ctrl+B D to detach, tmux attach to resume
 - .pt files: binary pickle, not for GitHub, belongs on HuggingFace Hub
 
-**Benchmark Numbers (fill in after 8B training):**
-| Config | Draft | Target | tok/s | Notes |
-|---|---|---|---|---|
-| Baseline | — | Llama 8B | 38.0 | measured Day 5 |
-| SpecDecode-Small | Llama 1B | Llama 8B | 44.4 | K=4, instruct draft |
-| Medusa 4-head | 4 heads | Llama 8B | TBD | needs 8B head training |
+**Benchmark Numbers (measured 2026-06-25):**
+| Config | tok/s | speedup | Notes |
+|---|---|---|---|
+| Baseline (Naive 8B) | 37.9 | 1.00x | measured Day 5 |
+| SpecDecode K=4 | 44.4 | 1.17x | 1B instruct draft, measured Day 5 |
+| Medusa 4-head (greedy) | 24.6 | 0.65x | epoch1 checkpoint, 2.22 tokens/round |
+
+**Why Medusa is 0.65x despite 2.22 tokens/round acceptance:**
+- Our greedy implementation does 3 backbone passes per round: PROPOSE (1 token) + VERIFY (K-1=3 tokens) + CACHE UPDATE (accepted[:-1] tokens)
+- Expected speedup = 2.22 / 3 ≈ 0.74x theoretical; gap to 0.65x is cross-GPU PCIe latency (h travels cuda:0→cuda:1 every round)
+- Fix: tree attention (Extension A) collapses 3 passes into ~1 pass → same acceptance, ~2x speedup
+
+**Quick wins applied (2026-06-26):**
+- Same-GPU placement (heads → cuda:0): NOT FEASIBLE. 8B backbone uses 22GB on cuda:0, heads need ~4.3GB (W2 alone = 4096×128256 per head × 4 heads). Only 1.51GB free. OOM.
+- float16 heads (`medusa.heads.half()`): DONE. Heads stay on cuda:1 but now float16. Result: 0.65x → 0.69x (small gain — heads are tiny vs backbone, 3-pass structure still dominates).
 
 **Training runs completed / in progress:**
 - Run 1 (10k examples, 2 epochs, DONE): epoch 0: 55.4905, epoch 1: 48.0302. Saved as `medusa_heads_8b_10k.pt`.
-- Run 2 (25k examples, 2 epochs, IN PROGRESS as of 2026-06-21 morning): tmux session `medusa_train2` on passpoli. Per-epoch checkpoints: `medusa_heads_8b_epoch0.pt` and `medusa_heads_8b_epoch1.pt`. ETA ~25 hours. Command: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. python scripts/train_medusa_8b.py`
+- Run 2 (25k examples, 2 epochs, CRASHED at epoch 1): server crashed mid-epoch 1. Only `medusa_heads_8b_epoch0.pt` saved. Epoch 0 avg loss = 11 (random baseline ≈ 34.7, so heads learned meaningfully).
+- Run 3 (resume from epoch 0, CRASHED again before saving): server went down again. `medusa_heads_8b_epoch1.pt` was NOT saved — confirmed by `ls` (2026-06-25). Only `medusa_heads_8b_epoch0.pt` remains.
+- Run 4 (resume from epoch 0, IN PROGRESS as of 2026-06-25): network back on passpoli. Launched with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. python scripts/train_medusa_8b.py` in tmux session `medusa_resume`. Script already configured: START_EPOCH=1, loads epoch0 checkpoint, scheduler resumes at correct LR point, saves `medusa_heads_8b_epoch1.pt` when done.
 
-**Starting Point for Next Session (Day 7 finish → Day 8):**
-1. SSH into passpoli → `tmux attach -t medusa_train2` → check if epoch 0 and epoch 1 printed and checkpoints saved
-2. If training crashed: check error. Most likely OOM → drop max_length to 256. Restart in new tmux session.
-3. If training succeeded: use `medusa_heads_8b_epoch1.pt` (best checkpoint) for benchmarking
-4. Write `scripts/benchmark_medusa.py` — load 8B + heads, run medusa_decode on 5 prompts, measure tok/s. Compare against 38.0 (baseline) and 44.4 (SpecDecode). Fill the benchmark table.
-5. Update checklist: "What a Medusa head is and how it differs from a separate draft model"
-6. After benchmark: move to Day 8 — FastAPI server and streaming.
+**Session 2026-06-24 notes:**
+- Discovered passpoli network down: port 443 blocked (GitHub + HuggingFace both unreachable). Used TRANSFORMERS_OFFLINE=1 + HF_DATASETS_OFFLINE=1 to use local cache.
+- Modified `scripts/train_medusa_8b.py` to support checkpoint resuming (START_EPOCH, CHECKPOINT variables at top; scheduler last_epoch fix). Committed to Mac repo; manually copied to passpoli via cat (git pull broken due to network).
+- Day 8 concepts taught and verified:
+  - Why a server is needed (decouple model from client, browser can't call Python directly)
+  - HTTP POST vs GET (GET = read no body, POST = send data with body; POST is right for /generate)
+  - WebSocket vs HTTP for streaming (HTTP = all-or-nothing response; WS = persistent push connection)
+  - FastAPI + uvicorn + pydantic roles explained
+
+**Session 2026-06-25 notes:**
+- Confirmed Run 3 crashed before saving epoch 1 (`medusa_heads_8b_epoch1.pt` absent from `ls`).
+- Understood the command flags before running: TRANSFORMERS_OFFLINE/HF_DATASETS_OFFLINE (no network needed), PYTORCH_CUDA_ALLOC_CONF (flexible GPU memory allocator), PYTHONPATH=. (find src/ from project root).
+- Network restored on passpoli — dropped offline flags, launched Run 4 in tmux `medusa_resume`.
+- Run 4 DONE: `medusa_heads_8b_epoch1.pt` saved. Three-way benchmark run.
+- Debugged device mismatch bug in `medusa_decode`: line 110 cast only dtype, not device. Fixed by adding `device=medusa.heads[0].W1.weight.device` to the `.to()` call. User diagnosed and wrote the fix themselves.
+- Medusa 0.65x result understood and explained: healthy acceptance (2.22 tokens/round) but 3-pass overhead. Path to 1.5-2x is Extension A (tree attention).
+- Rule re-established: never write code without explaining it first, stating recommendation (you write / I write), and waiting for user answer.
+
+**Starting Point for Next Session (Extension A — Tree Attention):**
+1. Goal: get Medusa from 0.65x → 1.5-2x+ by replacing 3 backbone passes per round with ~1
+2. Plan: tree of candidates (width 2-3 per position, depth K=4) verified in one pass with custom attention mask
+3. Candidate selection: torch.topk(head_logits, k=2) per head — NOT temperature sampling (temperature randomizes; we want the most likely candidates, which is top-k)
+4. Concept to teach FIRST: why normal attention breaks on a tree, and what the tree attention mask does
+5. After tree attention built: re-run benchmark, target >2x for resume
+6. Training verdict: 25k × 2 epochs is decent but not the bottleneck — tree attention is the unlock. More training (50k+ examples, 3-4 epochs) adds ~0.3-0.5x on top after tree attention is in.
+7. Days 8 + 9 (FastAPI server + frontend) still pending — do after Extension A
+8. All three days targeted for 2026-06-26.
+
+**Implementation decision (2026-06-26):**
+- Start with **simple Cartesian product tree** (width=2, depth=4, 30 nodes, 16 paths). Build and benchmark first.
+- **TODO after benchmarking:** implement calibrated optimal tree (Medusa paper Section 2.1.2). Greedy node selection using per-head top-k accuracies from calibration data — identical mask-building logic, better tree topology. Expected gain: ~10–20% better acceptance for same node budget. See CONCEPTS.md "Extension A — Tree Attention implementation decisions" for full details.
 
 ---
 
@@ -424,8 +459,11 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 | SpecDecode-Small speedup | 1.17x (K=4, instruct draft) | 2026-06-14 |
 | Best acceptance rate | 3.05 tokens/round (K=4) | 2026-06-14 |
 | Best K value | 4 | 2026-06-14 |
-| Medusa tok/s | | |
-| Medusa speedup | | |
+| Medusa tok/s (greedy, float32 heads) | 24.6 | 2026-06-25 |
+| Medusa speedup (greedy, float32 heads) | 0.65x | 2026-06-25 |
+| Medusa tok/s (greedy, float16 heads) | 26.4 | 2026-06-26 |
+| Medusa speedup (greedy, float16 heads) | 0.69x | 2026-06-26 |
+| Medusa acceptance rate | 2.22 tokens/round | 2026-06-25 |
 
 ---
 

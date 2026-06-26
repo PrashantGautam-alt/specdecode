@@ -309,3 +309,88 @@ h = h.to(device=self.heads[0].W1.weight.device, dtype=self.heads[0].W1.weight.dt
 Reads device and dtype from the heads' own weights — correct by construction regardless of placement. Hardcoding `"cuda:1"` would be fragile.
 
 **`.pt` files:** binary (Python pickle). Not human-readable — never open in nvim (exit with `:q!`). Not for GitHub (can't diff, bloat history, hit 100 MB limits). Real checkpoints go on HuggingFace Hub; toy checkpoints excluded via `*.pt` in `.gitignore`.
+
+---
+
+## Day 7 — Why Medusa is slow despite good acceptance (the 3-pass problem)
+
+### The bottleneck
+
+Measured: 2.22 tokens/round accepted, yet only 0.65x speedup. The math doesn't add up — unless you count how many backbone passes each round actually costs.
+
+**Our greedy implementation does 3 backbone passes per round:**
+
+| Pass | What it does | Why we can't skip it |
+|---|---|---|
+| **PROPOSE** | Feed last token → get `h` → heads propose K candidates | Need `h` for the heads AND backbone's opinion at position 0 |
+| **VERIFY** | Feed K−1 candidates → backbone's opinions at positions 1..K−1 | Need to know which candidates the big model agrees with |
+| **CACHE UPDATE** | Re-feed `accepted[:-1]` → advance cache to accepted state | Cache is contaminated by VERIFY; must restore to clean state |
+
+**The cost model:**
+
+```
+speedup ≈ tokens_accepted_per_round / backbone_passes_per_round
+        = 2.22 / 3
+        ≈ 0.74x   (theoretical ceiling)
+```
+
+We measured 0.65x, not 0.74x — the gap is cross-GPU PCIe latency: `h` travels `cuda:0 → cuda:1` every single round (backbone on GPU 0, heads on GPU 1). That crossing has a fixed cost per round that doesn't shrink with better acceptance.
+
+**The key insight:** acceptance rate is NOT the bottleneck here. Even if the heads were perfect (K=4 tokens accepted every round), we'd get at best 4/3 ≈ 1.33x. The denominator (3 passes) is the problem, not the numerator.
+
+---
+
+### Why 3 passes? (the VERIFY + CACHE UPDATE split)
+
+Recall the `DynamicCache` in-place mutation bug: VERIFY mutates the cache as it runs. After VERIFY, the cache reflects a world where ALL K−1 candidates were appended — but some were rejected. We can't use that as the starting point for the next round.
+
+So CACHE UPDATE re-feeds only the *accepted* tokens into a clean snapshot of the PROPOSE cache to advance it correctly. This is correct, but it's a third backbone call.
+
+**Equation tying everything together:**
+
+```
+passes per round = 1 (PROPOSE) + 1 (VERIFY) + 1 (CACHE UPDATE)
+                 = 3
+
+speedup = acceptance / passes = 2.22 / 3 ≈ 0.74x
+measured = 0.65x   (gap = ~0.09x from cross-GPU latency)
+```
+
+---
+
+### The fix: tree attention (Extension A)
+
+Tree attention collapses all 3 passes into approximately 1 by verifying a **tree of candidates** (not a chain) in a single forward pass with a custom attention mask.
+
+- Instead of the chain `[c0, c1, c2, c3]` (1 path), the tree holds multiple candidate paths simultaneously (e.g. top-2 per head = up to 2^4 = 16 paths, pruned to ~8).
+- One forward pass verifies all paths at once using a mask that controls which positions can attend to which.
+- CACHE UPDATE is absorbed: the tree pass already advances the cache to wherever the winner path lands.
+
+Projected speedup after tree attention: **1.5–2x+**, same acceptance rate, same trained weights, no new training needed.
+
+**The concept to learn before Extension A:** why does normal causal attention break on a tree, and what does the mask need to do differently?
+
+---
+
+## Extension A — Tree Attention implementation decisions
+
+### Simple Cartesian product tree (what we implement first)
+
+Width=2, depth=4 (4 heads). Every head contributes top-2 candidates, all combinations enumerated.
+
+- Nodes per level: 2, 4, 8, 16 → **30 total nodes**
+- Paths (root-to-leaf): 2^4 = **16**
+- Tree is built fresh each decode step from `torch.topk(head_logits, k=2)`
+- Mask is fixed structure — same shape every round, pre-computable
+
+### Calibrated optimal tree (TODO — implement after simple tree is benchmarked)
+
+The Medusa paper shows the Cartesian product tree is suboptimal. With a fixed node budget, some nodes (low-probability paths) waste slots that could go to high-probability ones.
+
+**The math:** define `a_k(i)` = accuracy of the i-th top prediction of head k (from calibration data). Assuming independence, accuracy of path `[i1, i2, i3, i4]` = `a_1(i1) × a_2(i2) × a_3(i3) × a_4(i4)`. The contribution of any node = its path accuracy.
+
+**The algorithm:** greedy node selection — start from root, repeatedly add the unselected node connected to the current tree with highest path accuracy, until node budget is exhausted. Identical in structure to Prim's MST algorithm (maximize accuracy instead of minimize cost).
+
+**Why deferred:** requires a calibration pass over data to measure per-head top-k accuracies. The mask-construction logic is the same — only the tree topology changes. Implement after simple tree confirms the speedup gain from tree attention itself.
+
+**Expected gain over simple tree:** ~10–20% better acceptance length for the same node budget.
