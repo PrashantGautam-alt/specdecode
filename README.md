@@ -7,6 +7,11 @@ Implements three inference strategies on Llama models, measures the speedup, and
 
 ---
 
+![Architecture](assets/architecture.png)
+*Shown with 3 Medusa heads for clarity. Implementation uses K=4.*
+
+---
+
 ## What it does
 
 **Speculative decoding** runs a small draft model to propose K tokens at once, then verifies all K in a single pass of the big target model. If the draft was right, you get K tokens for roughly the price of one. If it was wrong, you get one corrected token and try again. The output is mathematically identical to running the big model alone.
