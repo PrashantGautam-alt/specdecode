@@ -372,6 +372,58 @@ Projected speedup after tree attention: **1.5–2x+**, same acceptance rate, sam
 
 ---
 
+## Day 8 — FastAPI Server
+
+### Why a server is needed
+The browser and Python run in completely different environments — different processes, different machines, different languages. A server is the bridge: it speaks HTTP/WebSocket (what browsers understand) on one side and calls Python functions on the other.
+
+### POST vs GET
+- **GET** = "give me something" — no body, used for reading data
+- **POST** = "here's data, process it" — has a body, used when you're sending something to be acted on
+- `/generate` is POST: you're sending a prompt and asking the server to do work with it
+
+### FastAPI + uvicorn + pydantic — three separate jobs
+- **Pydantic**: validates incoming JSON → converts it to a typed Python object. If a field is the wrong type, it returns a 422 error before your code runs.
+- **FastAPI**: routing and request handling — maps URLs to Python functions, reads Pydantic models, serializes responses to JSON
+- **uvicorn**: the actual HTTP server — handles network connections, TCP, protocol parsing. FastAPI delegates all of that to uvicorn.
+
+### Dependency injection pattern
+`server.py` defines HOW to serve requests. `run_server.py` decides WHICH model to load and WHEN. `server.py` never imports or loads a model itself — it just uses whatever was injected into `server.backbone` and `server.tokenizer`. This means swapping the model (1B → 8B → Medusa) requires changing only `run_server.py`.
+
+---
+
+## Day 9 — WebSocket streaming frontend
+
+### How JavaScript talks to a WebSocket
+```javascript
+const ws = new WebSocket("ws://localhost:8000/stream");
+
+ws.onopen = () => {
+    ws.send(JSON.stringify({prompt: "...", max_new_tokens: 100}));
+};
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);  // {text, accepted}
+    // render token
+};
+
+ws.onclose = () => { /* final cleanup */ };
+```
+- `onopen` fires once when connection is established → send prompt here, not before (connection not ready before this)
+- `onmessage` fires once per token the server sends → update UI here
+- `onclose` fires when the server closes the connection → final stats update
+
+### Why tokens stream via WebSocket not HTTP
+HTTP is request-response: the client sends one request and waits for the full response. The entire generated text would have to be ready before anything is shown. WebSocket is a persistent two-way connection: the server can push each token the moment it's generated. The user sees text appearing live instead of waiting for the full output.
+
+### Token coloring
+Each token arrives as `{"text": "...", "accepted": true/false/null}`:
+- `true` → `#4361ee` (blue) — draft token accepted by backbone
+- `false` → `#780000` (dark red) — backbone correction
+- `null` → white — naive generation, no acceptance concept
+
+---
+
 ## Extension A — Tree Attention implementation decisions
 
 ### Simple Cartesian product tree (what we implement first)

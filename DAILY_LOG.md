@@ -395,14 +395,61 @@ Draft = Llama-3.2-1B-Instruct, Target = Llama-3.1-8B-Instruct, 100 tokens, 3 run
 ## Week 2: API, Visualization, Benchmarks, Deployment
 
 ### Day 8 — FastAPI Server and Streaming
-**Status:** NOT STARTED  
-**Deliverable:** FastAPI server running. POST /generate and WS /stream both work. Tested with curl.
+**Status:** DONE (2026-06-26) — server written, not yet tested on passpoli (server still down).
+
+**Deliverable:**
+- [x] `src/server.py` — FastAPI app: `POST /generate` + `WS /stream`
+- [x] `scripts/run_server.py` — loads model, injects into server module, starts uvicorn
+- [x] `scripts/test_server.py` — tests both endpoints (POST + WebSocket)
+- [ ] Live test on passpoli — pending server coming back online
+
+**What was built:**
+- `POST /generate`: receives `GenerateRequest` (prompt, max_new_tokens, mode), calls `naive_generate`, returns `{"output": text}`
+- `WS /stream`: accepts WebSocket, receives JSON prompt, streams tokens one by one as `{"text": token, "accepted": null}` (null = naive, no color)
+- Dependency injection pattern: `run_server.py` loads the model and sets `server.backbone` + `server.tokenizer` — `server.py` is model-agnostic
+- Pydantic validates all incoming requests — type mismatch returns 422 before generation runs
+
+**Concepts verified:**
+- Why a server is needed (browser can't call Python directly — different environments)
+- POST vs GET (POST = send data + process, GET = retrieve)
+- uvicorn's role (handles HTTP protocol + network connections; FastAPI handles routing/logic)
+- Pydantic validation (422 on type mismatch, before any code runs)
+- Dependency injection (server.py defines HOW to serve; run_server.py decides WHICH model and WHEN)
+
+**To test when passpoli is back:**
+```bash
+pip install fastapi uvicorn websockets
+PYTHONPATH=. python scripts/run_server.py   # Terminal 1
+PYTHONPATH=. python scripts/test_server.py  # Terminal 2
+```
 
 ---
 
 ### Day 9 — Token Visualization Frontend
-**Status:** NOT STARTED  
-**Deliverable:** Browser UI working. Tokens appear one by one. Green = accepted, Red = rejected. Stats bar updating live.
+**Status:** DONE (2026-06-26) — frontend written, not yet tested end-to-end (pending passpoli).
+
+**Deliverable:**
+- [x] `frontend/index.html` — single-file UI, no framework, no build step
+- [ ] Live end-to-end test — pending passpoli
+
+**What was built:**
+- Prompt textarea + Generate button
+- Token display area — tokens stream in live via WebSocket, colored: `#4361ee` (accepted), `#780000` (rejected), white (naive)
+- Stats bar: tokens/sec + token count, updating every token via `onmessage`
+- `onclose` fires final stats update when stream ends
+- Acceptance coloring will activate once speculative/Medusa mode is wired into the WebSocket endpoint — for now naive runs show white tokens
+
+**Key JavaScript mechanics:**
+- `ws.onopen` fires when connection established → send prompt (not before — connection not ready yet)
+- `ws.onmessage` fires per token → parse JSON, create colored `<span>`, append to output div
+- `ws.onclose` fires when server closes connection → final stats update
+
+**Starting Point for Next Session:**
+1. When passpoli comes back: `git pull` or manually copy `src/server.py`, `scripts/run_server.py`, `scripts/test_server.py`, `frontend/index.html`
+2. `pip install fastapi uvicorn websockets`
+3. Run server + test script → confirm `POST /generate` and `WS /stream` both work
+4. Open `frontend/index.html` in browser (update `ws://localhost:8000` → `ws://<passpoli-ip>:8000`)
+5. Next: wire speculative decode + Medusa into the stream endpoint so tokens get colored
 
 ---
 
