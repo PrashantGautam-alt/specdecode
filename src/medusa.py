@@ -267,7 +267,10 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
                 use_cache=True,
             )
         propose_cache = snap(propose_out.past_key_values)
-        h = propose_out.hidden_states[-1].to(medusa.heads[0].W1.weight.dtype)
+        h = propose_out.hidden_states[-1].to(
+            device=medusa.heads[0].W1.weight.device,
+            dtype=medusa.heads[0].W1.weight.dtype,
+        )
         head_logits = [medusa.heads[k](h)[0, -1, :] for k in range(K)]
         backbone_pred_0 = propose_out.logits[0,-1,:].argmax().item()
 
