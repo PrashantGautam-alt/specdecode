@@ -15,11 +15,16 @@ NUM_HEADS = 6
 EPOCHS = 4
 WARM_START = "medusa_heads_8b_epoch4.pt"  # load trained heads 0-3; heads 4-5 start as LM-head clones
 DATA = "train_sft[:25000]"
+MAX_LEN = 256
 
-# bfloat16 heads, not float32: six float32 heads + their gradients overflow one 24GB A5000.
-# bf16 halves both, and its float32-range exponent avoids the fp16 training NaNs we hit before.
-HEAD_DTYPE = torch.bfloat16
-MAX_LEN = 256  # shorter than the old 512 to keep activation memory in budget with 6 heads
+# WHY freeze heads 0-3 and train ONLY 4-5:
+# Two earlier runs (lr 5e-4 then 1e-4, all 6 heads, bf16) DIVERGED: loss climbed from ~18 toward the
+# ~43 random-level baseline. Cause: heads 0-3 were already trained (acceptance 3.06), so jointly
+# training them mostly *damaged* them, and bf16 added precision fragility. Fix: the warm heads are
+# done -> FREEZE them; only the 2 new heads need training. Frozen heads can't be damaged (no
+# divergence), and with only 2 heads carrying gradients we can stay in stable FLOAT32 and still fit
+# one 24GB A5000 (~19.5GB, less than the proven 4-head float32 run).
+TRAIN_HEADS = list(range(4, NUM_HEADS))  # [4, 5]
 
 
 if __name__ == "__main__":
@@ -41,13 +46,17 @@ if __name__ == "__main__":
     else:
         print(f"WARNING: {WARM_START} not found — training all 6 heads from scratch.")
 
-    medusa.heads.to(device="cuda:1", dtype=HEAD_DTYPE)
+    medusa.heads.to(device="cuda:1")  # FLOAT32 (default) — the stable training recipe
     medusa.heads.train()
 
-    # lr=1e-4 (not 5e-4): the first 5e-4 run DIVERGED — loss climbed from 18 toward the ~43
-    # random-level baseline, because the warm-started heads 0-3 were already good and 5e-4
-    # overshot/destroyed them. 1e-4 is the rate proven stable in the 4-head continuation.
-    optimizer = bnb.optim.Adam8bit(medusa.heads.parameters(), lr=1e-4)
+    # Freeze the warm heads; only heads 4-5 get gradients + optimizer state.
+    for i, head in enumerate(medusa.heads):
+        for p in head.parameters():
+            p.requires_grad = (i in TRAIN_HEADS)
+    trainable = [p for i in TRAIN_HEADS for p in medusa.heads[i].parameters()]
+    print(f"Training heads {TRAIN_HEADS} only; heads 0-3 frozen. Trainable tensors: {len(trainable)}")
+
+    optimizer = bnb.optim.Adam8bit(trainable, lr=1e-4)
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=DATA)
 
@@ -65,26 +74,27 @@ if __name__ == "__main__":
             with torch.no_grad():
                 bout = backbone(input_ids=input_ids, output_hidden_states=True)
                 h = bout.hidden_states[-1]
-            h = h.to(device="cuda:1", dtype=HEAD_DTYPE)
-            head_logits = [head(h) for head in medusa.heads]
+            h = h.to(device="cuda:1")
 
+            # Only the trainable heads (4,5) are run/scored — heads 0-3 are frozen and already good,
+            # so computing their loss would just waste compute and memory.
             loss = 0.0
-            for k in range(len(head_logits)):
+            for k in TRAIN_HEADS:
                 shift = k + 1  # head k predicts the token shift positions ahead
-                logits_k = head_logits[k][:, :-shift, :]
+                logits_k = medusa.heads[k](h)[:, :-shift, :]
                 labels_k = input_ids[:, shift:].to(logits_k.device)
-                # cross_entropy in float32 for numerical stability even though logits are bf16
-                loss_k = F.cross_entropy(logits_k.float().reshape(-1, logits_k.size(-1)), labels_k.reshape(-1))
-                loss = loss + (0.8 ** k) * loss_k  # later heads weighted down: harder, less reliable
+                loss_k = F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), labels_k.reshape(-1))
+                loss = loss + (0.8 ** k) * loss_k  # later head weighted down: harder, less reliable
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(medusa.heads.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
             optimizer.step()
             scheduler.step()
             epoch_loss += loss.item()
-            # mid-epoch heartbeat: confirms it fits in memory, isn't NaN, and is learning,
-            # without waiting hours for the per-epoch line.
+            # mid-epoch heartbeat: confirms it fits in memory, isn't NaN, and is learning.
+            # NOTE: this loss covers ONLY heads 4-5, so it starts lower than the all-heads number;
+            # what matters is that it TRENDS DOWN.
             if step % 500 == 0:
                 print(f"  epoch {epoch} step {step}/{len(ds)}: loss {loss.item():.4f}", flush=True)
         print(f"epoch {epoch}: loss {epoch_loss / len(ds):.4f}", flush=True)
