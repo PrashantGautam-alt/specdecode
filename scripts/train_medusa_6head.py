@@ -74,7 +74,8 @@ if __name__ == "__main__":
             with torch.no_grad():
                 bout = backbone(input_ids=input_ids, output_hidden_states=True)
                 h = bout.hidden_states[-1]
-            h = h.to(device="cuda:1")
+            # backbone is float16 -> cast h to float32 to match the (float32) heads
+            h = h.to(device="cuda:1", dtype=torch.float32)
 
             # Only the trainable heads (4,5) are run/scored — heads 0-3 are frozen and already good,
             # so computing their loss would just waste compute and memory.
