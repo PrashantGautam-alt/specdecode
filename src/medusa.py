@@ -456,7 +456,7 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
-def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False):
+def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None):
     """
     Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
 
@@ -505,6 +505,7 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
 
     while generated.shape[1] < start_len + max_new_tokens:
         context_len = generated.shape[1]  # cache length = number of committed tokens
+        pending_in = pending  # snapshot for the debug dump (pending gets overwritten below)
 
         # BUILD TREE from seed_h using heads 1..K-1 (head 0 predicts the already-known pending).
         head_logits = [medusa.heads[k](seed_h)[:].reshape(-1) for k in range(1, K)]
@@ -611,6 +612,29 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
         committed_this_round = [pending] + best_accepted[:-1]
         new_tensor = torch.tensor([committed_this_round], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
+
+        # DEBUG — compare cumulative output against the greedy reference; on the first token that
+        # disagrees, dump this round's full state and stop. Because each round only appends, the
+        # first mismatch is always introduced in the round that produced it, so this round's state
+        # is the relevant one. Off by default; ref_ids is the greedy continuation (prompt removed).
+        if debug and ref_ids is not None:
+            gen_new = generated[0, start_len:].tolist()
+            for i in range(min(len(gen_new), len(ref_ids))):
+                if gen_new[i] != ref_ids[i]:
+                    dec = lambda t: tokenizer.decode([t])
+                    print(f"\n*** FIRST DIVERGENCE at generated position {i} (round {rounds + 1}) ***")
+                    print(f"  expected (greedy): {ref_ids[i]:>6} {dec(ref_ids[i])!r}")
+                    print(f"  fused produced:    {gen_new[i]:>6} {dec(gen_new[i])!r}")
+                    print(f"  --- this round's state ---")
+                    print(f"  context_len (committed before round): {context_len}")
+                    print(f"  pending_in (token at position {context_len}): {pending_in:>6} {dec(pending_in)!r}")
+                    print(f"  backbone_pred_0 (true token at {context_len + 1}): {backbone_pred_0:>6} {dec(backbone_pred_0)!r}")
+                    print(f"  tree depth-1 candidates (head 1 top-{width}): {tokens[:width]} -> {[dec(t) for t in tokens[:width]]}")
+                    print(f"  best_accepted (true tokens kept): {best_accepted}")
+                    print(f"  best_path_nodes (matched tree nodes): {best_path_nodes}")
+                    print(f"  committed_this_round: {committed_this_round} -> {tokenizer.decode(committed_this_round)!r}")
+                    print(f"  new pending (bonus -> next round): {new_bonus:>6} {dec(new_bonus)!r}")
+                    return tokenizer.decode(generated[0], skip_special_tokens=True)
 
         # NEW CACHE = context + prepend + matched nodes (excludes the new bonus).
         kv_idx = list(range(context_len)) + [context_len] + [context_len + 1 + n for n in best_path_nodes]
