@@ -44,7 +44,10 @@ if __name__ == "__main__":
     medusa.heads.to(device="cuda:1", dtype=HEAD_DTYPE)
     medusa.heads.train()
 
-    optimizer = bnb.optim.Adam8bit(medusa.heads.parameters(), lr=5e-4)
+    # lr=1e-4 (not 5e-4): the first 5e-4 run DIVERGED — loss climbed from 18 toward the ~43
+    # random-level baseline, because the warm-started heads 0-3 were already good and 5e-4
+    # overshot/destroyed them. 1e-4 is the rate proven stable in the 4-head continuation.
+    optimizer = bnb.optim.Adam8bit(medusa.heads.parameters(), lr=1e-4)
 
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=DATA)
 
