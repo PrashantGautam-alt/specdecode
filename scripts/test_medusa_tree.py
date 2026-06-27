@@ -4,7 +4,7 @@ from src.models import ModelLoader
 from src.medusa import MedusaModel, medusa_decode, medusa_decode_tree, medusa_decode_tree_fused
 from src.sampler import naive_generate
 
-CHECKPOINT = "medusa_heads_8b_epoch1.pt"
+CHECKPOINT = "medusa_heads_8b_epoch4.pt"
 MAX_NEW_TOKENS = 100
 K = 4
 WIDTH = 2
@@ -34,10 +34,16 @@ if __name__ == "__main__":
     tokenizer = loader.tokenizer
 
     medusa = MedusaModel(backbone, num_heads=K)
-    medusa.heads.to(device="cuda:1")
-    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:1"))
+    # Load the trained float32 weights first, THEN cast the heads to float16 and put them on
+    # cuda:0 next to the backbone. Two A5000s have 24 GB each: float32 heads (8.6 GB) + backbone
+    # (16 GB) don't fit on one card, which is why they used to live on cuda:1. float16 halves the
+    # heads to ~4.3 GB, so everything fits on cuda:0 — killing the per-round cuda:0->cuda:1 transfer
+    # of the hidden state h. Correctness is unaffected: heads only PROPOSE; the backbone VERIFIES,
+    # so worse float16 guesses can only lower acceptance, never change the output.
+    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:0"))
+    medusa.heads.to(device="cuda:0", dtype=torch.float16)
     medusa.heads.eval()
-    print(f"Loaded Medusa heads from {CHECKPOINT}")
+    print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)")
 
     # --- Correctness check ---
     # medusa_decode_tree must produce identical output to plain greedy decoding.
@@ -106,7 +112,7 @@ if __name__ == "__main__":
     print(f"{'-'*68}")
     print(f"{'Naive 8B (baseline)':<32} {NAIVE_TPS:>8.1f}  {'1.00x':>8}")
     print(f"{'SpecDecode K=4':<32} {SPEC_TPS:>8.1f}  {SPEC_SPEEDUP:>7.2f}x  1B draft, instruct")
-    print(f"{'Medusa greedy (3-pass)':<32} {greedy_tps:>8.1f}  {greedy_tps/NAIVE_TPS:>7.2f}x  epoch1")
-    print(f"{'Medusa tree (width=2)':<32} {tree_tps:>8.1f}  {tree_tps/NAIVE_TPS:>7.2f}x  epoch1")
-    print(f"{'Medusa tree FUSED (1 pass)':<32} {fused_tps:>8.1f}  {fused_tps/NAIVE_TPS:>7.2f}x  epoch1")
+    print(f"{'Medusa greedy (3-pass)':<32} {greedy_tps:>8.1f}  {greedy_tps/NAIVE_TPS:>7.2f}x  epoch4 fp16 1-GPU")
+    print(f"{'Medusa tree (width=2)':<32} {tree_tps:>8.1f}  {tree_tps/NAIVE_TPS:>7.2f}x  epoch4 fp16 1-GPU")
+    print(f"{'Medusa tree FUSED (1 pass)':<32} {fused_tps:>8.1f}  {fused_tps/NAIVE_TPS:>7.2f}x  epoch4 fp16 1-GPU")
     print(f"{'='*68}")
