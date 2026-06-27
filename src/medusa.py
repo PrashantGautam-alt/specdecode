@@ -659,6 +659,22 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
                     print(f"  best_path_nodes (matched tree nodes): {best_path_nodes}")
                     print(f"  committed_this_round: {committed_this_round} -> {tokenizer.decode(committed_this_round)!r}")
                     print(f"  new pending (bonus -> next round): {new_bonus:>6} {dec(new_bonus)!r}")
+
+                    # Confirm/refute the prefill-vs-decode hypothesis: compute the token after
+                    # pending_in three ways and show top-2 logits + gap.
+                    #   parallel    = pending inside the fused multi-query pass (what we use)
+                    #   incremental = pending as a lone token vs the cache (decode mode == HF greedy)
+                    def top2(logits):
+                        v, t = torch.topk(logits.float(), 2)
+                        return [(dec(t[j].item()), round(v[j].item(), 4)) for j in range(2)], round((v[0] - v[1]).item(), 4)
+                    par_top2, par_gap = top2(out.logits[0, 0, :])
+                    with torch.no_grad():
+                        inc = medusa.backbone(input_ids=torch.tensor([[pending_in]], device=device),
+                                              past_key_values=snap(cache), use_cache=True)
+                    inc_top2, inc_gap = top2(inc.logits[0, -1, :])
+                    print(f"  --- prediction after pending, two ways ---")
+                    print(f"  PARALLEL (fused pass)    top2={par_top2}  gap={par_gap}")
+                    print(f"  INCREMENTAL (decode)     top2={inc_top2}  gap={inc_gap}")
                     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
         # NEW CACHE = context + prepend + matched nodes (excludes the new bonus).

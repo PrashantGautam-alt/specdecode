@@ -98,4 +98,24 @@ Added a stronger debug check: each round, recompute the next token with a FRESH,
 forward over the true prefix (`generated ++ pending`) and compare it to the cache-based
 `backbone_pred_0`. The first round they disagree is the first corrupted cache. Also print the
 incoming cache length vs `generated` length to catch an off-by-one directly.
+
+### Step 2 result — the cache is NOT corrupt (surprise)
+`CACHE WRONG` never fired. Every round: incoming cache length == generated length, and a fresh
+cacheless recompute predicted the SAME token as the cache-based `backbone_pred_0`. So the cache
+is faithful. The disagreement is between the **fused decoder (' describes')** and **HF greedy
+(' explains')** on an identical prefix.
+
+**New hypothesis — prefill vs decode fp16 numerics.** HF greedy decodes *incrementally*: one new
+token at a time against a cache ("decode mode"). The fused decoder gets `backbone_pred_0` from
+the `pending` token sitting inside a *parallel* pass over `[pending] + tree` ("prefill mode").
+In fp16, prefill and decode do their matmuls in different shapes/reduction orders, so logits
+differ in the 3rd-4th decimal. On a near-tie (' explains' vs ' describes') that flips the argmax.
+The non-fused tree avoids this because it computes `backbone_pred_0` from a *separate single-token*
+pass (decode mode, identical to greedy) — exactly the pass fusion removes.
+
+### Step 3 — prove or refute it
+At the diverging round, compute the token after `pending` two ways and print top-2 logits + gap:
+- PARALLEL = pending inside the fused multi-query pass (what we use)
+- INCREMENTAL = pending as a lone token vs the cache (decode mode == HF greedy)
+If INCREMENTAL gives ' explains' and the gap is tiny, the hypothesis is confirmed.
 - _(results to be filled in after the run)_
