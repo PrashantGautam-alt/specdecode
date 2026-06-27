@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 from transformers import DynamicCache
@@ -243,8 +244,14 @@ def build_tree_mask(parent_indices):
 
     return mask
 
-def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False):
+def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, profile=False):
     device = next(medusa.backbone.parameters()).device
+
+    # profile=False -> the timing branches below never run, so the hot path is unchanged.
+    # When True, we sync the GPU at each phase boundary and accumulate per-phase time so we
+    # can see where a round's ~67 ms actually goes (compute vs cache bookkeeping vs Python).
+    timings = {"propose": 0.0, "build_tree": 0.0, "verify_setup": 0.0, "verify_fwd": 0.0,
+               "verify_post": 0.0, "find_path": 0.0, "cache_update": 0.0}
 
     def snap(kv):
         legacy = kv.to_legacy_cache() if hasattr(kv, 'to_legacy_cache') else kv
@@ -260,6 +267,9 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
     cache = snap(prime_out.past_key_values)
 
     while generated.shape[1] < start_len + max_new_tokens:
+
+        if profile:
+            torch.cuda.synchronize(); t0 = time.perf_counter()
 
         # PHASE 1 — PROPOSE
         with torch.no_grad():
@@ -277,9 +287,15 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
         head_logits = [medusa.heads[k](h)[0, -1, :] for k in range(K)]
         backbone_pred_0 = propose_out.logits[0,-1,:].argmax().item()
 
+        if profile:
+            torch.cuda.synchronize(); t1 = time.perf_counter()
+
         # PHASE 2 — BUILD TREE
         tokens, parent_indices = build_tree_candidates(head_logits=head_logits, width=width)
         tree_mask = build_tree_mask(parent_indices=parent_indices)
+
+        if profile:
+            torch.cuda.synchronize(); t2 = time.perf_counter()
 
         # PHASE 3 — TREE VERIFY
         # we want past_key_values (reuse context KV) + custom 4D tree mask.
@@ -334,6 +350,8 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
         # (context_len tokens) for the m==1 case in Phase 5. Without this, the next round
         # reuses a cache polluted with 30 phantom nodes → mask/KV length mismatch.
         verify_input_cache = snap(propose_cache)
+        if profile:
+            torch.cuda.synchronize(); t2a = time.perf_counter()
         try:
             with torch.no_grad():
                 verify_out = medusa.backbone(
@@ -346,9 +364,15 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             for h in hooks:
                 h.remove()
 
+        if profile:
+            torch.cuda.synchronize(); t2b = time.perf_counter()
+
         verify_cache = snap(verify_out.past_key_values)
         verify_logits = verify_out.logits[0]  # [num_nodes, vocab_size]
         backbone_preds = verify_logits.argmax(dim=-1).tolist()
+
+        if profile:
+            torch.cuda.synchronize(); t3 = time.perf_counter()
 
         # PHASE 4 — FIND BEST PATH
         # also track best_path_nodes: the tree node indices for accepted tokens.
@@ -387,6 +411,9 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             best_accepted = [backbone_pred_0]
             best_path_nodes = []
 
+        if profile:
+            torch.cuda.synchronize(); t4 = time.perf_counter()
+
         # PHASE 5 — CACHE UPDATE via KV extraction (no backbone forward)
         # accepted tokens at t+1..t+m-1 correspond to tree nodes best_path_nodes[0..m-2].
         # their KV already exists in verify_cache at positions context_len + node_index.
@@ -401,6 +428,16 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
             trimmed = tuple((kv[0][:, :, idx, :], kv[1][:, :, idx, :]) for kv in legacy)
             cache = DynamicCache.from_legacy_cache(trimmed)
 
+        if profile:
+            torch.cuda.synchronize(); t5 = time.perf_counter()
+            timings["propose"] += t1 - t0
+            timings["build_tree"] += t2 - t1
+            timings["verify_setup"] += t2a - t2
+            timings["verify_fwd"] += t2b - t2a
+            timings["verify_post"] += t3 - t2b
+            timings["find_path"] += t4 - t3
+            timings["cache_update"] += t5 - t4
+
         new_tensor = torch.tensor([best_accepted], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
         rounds += 1
@@ -410,6 +447,12 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
 
     if verbose:
         print(f"  avg tokens/round: {total_accepted / rounds:.2f} over {rounds} rounds")
+    if profile:
+        total = sum(timings.values())
+        print(f"\n--- per-round timing breakdown (avg over {rounds} rounds) ---")
+        for name, t in timings.items():
+            print(f"  {name:<13} {1000*t/rounds:>7.2f} ms/round  {100*t/total:>5.1f}%")
+        print(f"  {'measured':<13} {1000*total/rounds:>7.2f} ms/round  (sum of phases)")
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
