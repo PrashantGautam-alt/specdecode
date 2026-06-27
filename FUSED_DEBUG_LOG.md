@@ -139,4 +139,48 @@ take the fused's own output, run one clean forward, and confirm every committed 
 model's argmax or tied for it (gap < 0.5; real ties are ~0.0-0.05, a real bug would be >> 1.0).
 This proves the fused output is a valid greedy decode without depending on HF's tie-breaks. Same
 run times the fused decoder vs naive.
-- _(results to be filled in after the run)_
+
+### Step 4 result — PASSED, and the honest speed verdict
+```
+tokens checked:            103
+exact argmax matches:      102
+argmax mismatches (ties):  1   (gap < 0.5)
+real errors:               0
+largest logit gap seen:    0.0000   (pos 26: ' describes' vs ' explains', a dead tie)
+PASSED — every token is the model's argmax or tied for it. Fused IS a valid greedy decode.
+
+naive 8B:    37.9 tok/s  (1.00x)
+fused tree:  47.1 tok/s  (1.24x)
+```
+
+---
+
+## 4. Conclusion — what we found, and what it means
+
+**What broke:** nothing. The fused decoder was correct all along. The `MISMATCH` came from an
+exact-bit-match test that can't survive fp16 ties (two tokens with identical logits, where the
+parallel and incremental matmul paths round the tie-break differently). 102/103 tokens are the
+exact argmax; the one exception has a 0.0000 logit gap.
+
+**What we fixed:** our *understanding* and our *test*. `scripts/verify_fused.py` now proves
+correctness the right way — self-consistency (every token is argmax-or-tied), independent of HF's
+tie-breaks.
+
+**The speed reality (be honest):** fused = 1.24x, the working tree = 1.19x. Fusing one backbone
+pass away did NOT roughly double speed, even though the profiler said passes are 94% of a round.
+Why: fusing the PROPOSE pass into VERIFY costs a tree level (head 0 is spent on the prepended
+`pending`, so the fused tree is depth K-1=3 instead of 4). A shallower tree accepts fewer tokens
+per round. On a memory-bound model a pass ≈ a fixed ~30 ms cost and a tree level ≈ acceptance —
+and the two roughly cancel. Net: ~1.19x → ~1.24x, a small win, not a doubling.
+
+**Implication for the 1.5x goal:** neither the tree nor the fused decoder reaches it at K=4.
+Every speed lever we tried is now mapped:
+- Wider tree (Lever A): dead — acceptance is flat in width.
+- Cut overhead (Lever B): dead — overhead is only ~6% of a round.
+- Fuse 2 passes -> 1 (Lever B'): marginal — trades a pass for a tree level.
+- **Higher acceptance (Lever C): the only lever left with headroom.**
+
+The structural way to raise acceptance is a **deeper tree, which needs more heads**. With more
+heads (K=6), the *fused* decoder (1 pass/round) could run a depth-5 tree: one cheap pass, but
+many tokens accepted per round. That combination — fused's single pass + a deep tree from more
+heads — is the principled path to 1.5x and beyond. Cost: training a new, larger head set.
