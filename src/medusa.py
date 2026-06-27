@@ -456,7 +456,8 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
-def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None, return_ids=False):
+def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None, return_ids=False,
+                             accept_mode="greedy", temperature=1.0, epsilon=0.3, delta=0.09):
     """
     Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
 
@@ -598,38 +599,84 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
                 print(f"  last 6 committed tokens: {generated[0, -6:].tolist()} -> {tokenizer.decode(generated[0, -6:])!r}")
                 return tokenizer.decode(generated[0], skip_special_tokens=True)
 
-        # FIND BEST PATH — identical accept logic to the non-fused version.
+        # FIND BEST PATH
         leaf_start = num_nodes - width**tree_depth
-        best_accepted = []
-        best_path_nodes = []
-        for leaf in range(leaf_start, num_nodes):
-            path = []
-            node = leaf
-            while node != -1:
-                path.append(node)
-                node = parent_indices[node]
-            path.reverse()
 
-            accepted = [backbone_pred_0]
-            path_nodes = []
-            if backbone_pred_0 == tokens[path[0]]:
-                path_nodes.append(path[0])
-                for j in range(len(path)):
-                    if j + 1 < len(path):
-                        accepted.append(backbone_preds[path[j]])
-                        if backbone_preds[path[j]] != tokens[path[j + 1]]:
-                            break
-                        path_nodes.append(path[j + 1])
-                    else:
-                        accepted.append(backbone_preds[path[j]])  # bonus token
-
-            if len(accepted) > len(best_accepted):
-                best_accepted = accepted
-                best_path_nodes = path_nodes
-
-        if not best_accepted:
-            best_accepted = [backbone_pred_0]
+        if accept_mode == "greedy":
+            # STRICT GREEDY (default, verified): emit the backbone's argmax; accept a tree branch
+            # only while each candidate exactly equals that argmax. Output == plain greedy decode.
+            best_accepted = []
             best_path_nodes = []
+            for leaf in range(leaf_start, num_nodes):
+                path = []
+                node = leaf
+                while node != -1:
+                    path.append(node)
+                    node = parent_indices[node]
+                path.reverse()
+
+                accepted = [backbone_pred_0]
+                path_nodes = []
+                if backbone_pred_0 == tokens[path[0]]:
+                    path_nodes.append(path[0])
+                    for j in range(len(path)):
+                        if j + 1 < len(path):
+                            accepted.append(backbone_preds[path[j]])
+                            if backbone_preds[path[j]] != tokens[path[j + 1]]:
+                                break
+                            path_nodes.append(path[j + 1])
+                        else:
+                            accepted.append(backbone_preds[path[j]])  # bonus token
+
+                if len(accepted) > len(best_accepted):
+                    best_accepted = accepted
+                    best_path_nodes = path_nodes
+
+            if not best_accepted:
+                best_accepted = [backbone_pred_0]
+                best_path_nodes = []
+
+        else:
+            # TYPICAL ACCEPTANCE (Medusa paper): emit the CANDIDATE token (not the argmax) when the
+            # backbone considers it "typical" — p(candidate) > min(epsilon, delta * exp(-H(p))).
+            # When the model is unsure (high entropy H) the threshold drops, so more candidates pass
+            # -> a deeper/wider tree finally pays off. NOT lossless: this is temperature sampling.
+            # row 0 of out.logits is the distribution after `pending`; row 1+n is after tree node n.
+            logits_all = out.logits[0].float() / temperature       # [q_len, vocab]
+            probs = torch.softmax(logits_all, dim=-1)
+            H = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)      # entropy per row
+            thresh = torch.minimum(torch.full_like(H, epsilon), delta * torch.exp(-H))  # [q_len]
+
+            best_cands = []      # accepted candidate tokens (no bonus yet)
+            best_path_nodes = []
+            for leaf in range(leaf_start, num_nodes):
+                path = []
+                node = leaf
+                while node != -1:
+                    path.append(node)
+                    node = parent_indices[node]
+                path.reverse()
+
+                cands = []
+                path_nodes = []
+                row = 0  # start from the distribution after `pending`
+                for node in path:
+                    cand = tokens[node]
+                    if probs[row, cand].item() > thresh[row].item():
+                        cands.append(cand)
+                        path_nodes.append(node)
+                        row = 1 + node  # next candidate is judged by the distribution after this node
+                    else:
+                        break
+                if len(cands) > len(best_cands):
+                    best_cands = cands
+                    best_path_nodes = path_nodes
+
+            # bonus: SAMPLE from the distribution after the last accepted node (or after pending).
+            # always produced, so we make progress even if no candidate was typical (m==1).
+            last_row = 1 + best_path_nodes[-1] if best_path_nodes else 0
+            bonus = torch.multinomial(probs[last_row], 1).item()
+            best_accepted = best_cands + [bonus]
 
         # COMMIT: the old pending (guaranteed) plus every tree token EXCEPT the new bonus.
         # the new bonus becomes next round's pending (KV deliberately left out of the cache).
