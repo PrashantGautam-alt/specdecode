@@ -118,4 +118,25 @@ At the diverging round, compute the token after `pending` two ways and print top
 - PARALLEL = pending inside the fused multi-query pass (what we use)
 - INCREMENTAL = pending as a lone token vs the cache (decode mode == HF greedy)
 If INCREMENTAL gives ' explains' and the gap is tiny, the hypothesis is confirmed.
+
+### Step 3 result — CONFIRMED: it's an fp16 tie, not a bug
+```
+PARALLEL (fused pass)    top2=[(' describes', 19.6406), (' explains', 19.625)]  gap=0.0156
+INCREMENTAL (decode)     top2=[(' describes', 19.625),  (' explains', 19.625)]  gap=0.0
+```
+' describes' and ' explains' have essentially identical logits (19.64 vs 19.625). The gap is
+0.0156 in the parallel pass and a literal 0.0 tie in incremental decode. The model considers the
+two words equally good. fp16 rounding differences between the parallel and incremental matmul
+paths decide the argmax tie differently → the "MISMATCH" is a coin flip on a dead tie.
+
+**Conclusion: the fused decoder was never broken.** It faithfully greedy-decodes. Our correctness
+test (exact bit-match with HF greedy) was too strict — no fp16 tree decoder can match greedy
+across ties. The non-fused tree only "passed" because it happened not to hit a tie on this prompt.
+
+### Step 4 — rigorous proof across the whole generation + real speed
+One divergence being a tie doesn't prove all are. `scripts/verify_fused.py` checks SELF-CONSISTENCY:
+take the fused's own output, run one clean forward, and confirm every committed token is the
+model's argmax or tied for it (gap < 0.5; real ties are ~0.0-0.05, a real bug would be >> 1.0).
+This proves the fused output is a valid greedy decode without depending on HF's tie-breaks. Same
+run times the fused decoder vs naive.
 - _(results to be filled in after the run)_

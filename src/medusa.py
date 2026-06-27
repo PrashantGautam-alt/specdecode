@@ -456,7 +456,7 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 
-def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None):
+def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None, return_ids=False):
     """
     Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
 
@@ -704,4 +704,7 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
 
     if verbose:
         print(f"  avg new tokens/round: {total_new / rounds:.2f} over {rounds} rounds")
+    # return_ids lets a verifier check the raw token sequence (decode->retokenize isn't lossless).
+    if return_ids:
+        return generated[0]
     return tokenizer.decode(generated[0], skip_special_tokens=True)
