@@ -53,7 +53,7 @@ if __name__ == "__main__":
 
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
-        for example in ds:
+        for step, example in enumerate(ds):
             text = tokenizer.apply_chat_template(example["messages"], tokenize=False, add_generation_prompt=False)
             input_ids = tokenizer(text, return_tensors="pt", max_length=MAX_LEN, truncation=True).input_ids.to("cuda:0")
 
@@ -80,5 +80,9 @@ if __name__ == "__main__":
             optimizer.step()
             scheduler.step()
             epoch_loss += loss.item()
+            # mid-epoch heartbeat: confirms it fits in memory, isn't NaN, and is learning,
+            # without waiting hours for the per-epoch line.
+            if step % 500 == 0:
+                print(f"  epoch {epoch} step {step}/{len(ds)}: loss {loss.item():.4f}", flush=True)
         print(f"epoch {epoch}: loss {epoch_loss / len(ds):.4f}", flush=True)
         torch.save(medusa.heads.state_dict(), f"medusa_heads_8b_6head_epoch{epoch}.pt")
