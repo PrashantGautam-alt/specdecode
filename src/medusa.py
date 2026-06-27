@@ -506,6 +506,9 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
     while generated.shape[1] < start_len + max_new_tokens:
         context_len = generated.shape[1]  # cache length = number of committed tokens
         pending_in = pending  # snapshot for the debug dump (pending gets overwritten below)
+        if debug:
+            # incoming cache length should equal generated length (one KV per committed token)
+            cache_len_in = cache.to_legacy_cache()[0][0].shape[2]
 
         # BUILD TREE from seed_h using heads 1..K-1 (head 0 predicts the already-known pending).
         head_logits = [medusa.heads[k](seed_h)[:].reshape(-1) for k in range(1, K)]
@@ -572,6 +575,28 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
         hidden = out.hidden_states[-1]            # [1, q_len, dim], on backbone device
         backbone_pred_0 = out.logits[0, 0, :].argmax().item()         # true token at P+1
         backbone_preds = out.logits[0, 1:, :].argmax(dim=-1).tolist()  # prediction after each node
+
+        # DEBUG — does the CACHE produce the same next token as a fresh cacheless pass?
+        # backbone_pred_0 comes from pending attending to the incoming cache. If that disagrees
+        # with a clean forward over the true prefix (generated ++ pending), the cache is corrupt.
+        # The first round this fires is the first bad cache → pins the bug to the prior round's
+        # cache construction.
+        if debug:
+            with torch.no_grad():
+                true_prefix = torch.cat([generated, torch.tensor([[pending]], device=device)], dim=1)
+                fresh = medusa.backbone(input_ids=true_prefix, use_cache=False)
+            fresh_pred = fresh.logits[0, -1, :].argmax().item()
+            if fresh_pred != backbone_pred_0 or cache_len_in != context_len:
+                dec = lambda t: tokenizer.decode([t])
+                print(f"\n*** CACHE WRONG at round {rounds + 1} ***")
+                print(f"  incoming cache length: {cache_len_in}   generated length: {context_len}"
+                      f"   {'(MISMATCH!)' if cache_len_in != context_len else '(ok)'}")
+                print(f"  true prefix length (generated + pending): {true_prefix.shape[1]}")
+                print(f"  pending (prepended at pos {context_len}): {pending:>6} {dec(pending)!r}")
+                print(f"  backbone_pred_0 (FROM CACHE):   {backbone_pred_0:>6} {dec(backbone_pred_0)!r}")
+                print(f"  fresh recompute (NO CACHE):     {fresh_pred:>6} {dec(fresh_pred)!r}")
+                print(f"  last 6 committed tokens: {generated[0, -6:].tolist()} -> {tokenizer.decode(generated[0, -6:])!r}")
+                return tokenizer.decode(generated[0], skip_special_tokens=True)
 
         # FIND BEST PATH — identical accept logic to the non-fused version.
         leaf_start = num_nodes - width**tree_depth

@@ -72,4 +72,30 @@ built from heads 1..K-1 (depth K-1 = 3 instead of 4). One tree level traded for 
 - Added `debug` + `ref_ids` params to `medusa_decode_tree_fused` (guarded; off by default the
   hot path is unchanged). `scripts/debug_fused.py` generates a greedy reference, then runs the
   fused decoder against it and prints the first divergence with full round state.
+
+### Step 1 result — first divergence at output position 14 (round 10)
+```
+expected (greedy): ' explains'
+fused produced:    ' describes'
+pending_in (token at position 25): ' that'
+backbone_pred_0 (true token at 26): ' describes'   <-- the model's OWN prediction, and it's wrong
+```
+The fused output matched greedy exactly up to "...modern physics that". Then the model's own
+next-token prediction (`backbone_pred_0`) was ' describes' where greedy gives ' explains'.
+
+**The deduction (important):** the committed token IDs matched greedy *exactly* up to ' that'.
+Same model + identical token prefix + greedy = must give the identical next token — UNLESS the
+model is reading a corrupted context. The model attends to the **KV cache**, not to the
+`generated` list we print for ourselves. So by round 10 the cache had drifted from the true
+sequence even though the tokens we recorded looked correct. It surfaced at round 10 (not round 1)
+because the error accumulated quietly and only flipped a close argmax here.
+
+Note: the *non-fused* tree reuses KV the same way and is correct, so generic KV reuse is not the
+bug — it's something **fused-specific** in how the cache is carried between rounds.
+
+### Step 2 — pin the exact round the cache first goes wrong
+Added a stronger debug check: each round, recompute the next token with a FRESH, cacheless
+forward over the true prefix (`generated ++ pending`) and compare it to the cache-based
+`backbone_pred_0`. The first round they disagree is the first corrupted cache. Also print the
+incoming cache length vs `generated` length to catch an off-by-one directly.
 - _(results to be filled in after the run)_
