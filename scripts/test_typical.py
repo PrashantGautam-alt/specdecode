@@ -19,9 +19,9 @@ from src.models import ModelLoader
 from src.medusa import MedusaModel, medusa_decode_tree_fused
 from src.sampler import naive_generate
 
-CHECKPOINT = "medusa_heads_8b_epoch4.pt"
+CHECKPOINT = "medusa_heads_8b_6head_epoch3.pt"
 MAX_NEW_TOKENS = 100
-K = 4
+K = 6
 WIDTH = 2
 TEMPERATURE = 1.0
 PROMPT = "Explain the theory of relativity in simple terms:"
