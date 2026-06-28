@@ -244,6 +244,46 @@ def build_tree_mask(parent_indices):
 
     return mask
 
+
+def tree_leaves(parent_indices):
+    """
+    Indices of leaf nodes (nodes that are nobody's parent).
+
+    The Cartesian tree's leaves are always its last width**depth nodes, but a calibrated
+    tree's leaves can sit at any depth (a shallow node with no children is a leaf). Computing
+    the leaf set from the structure works for BOTH, so it replaces the old `leaf_start` math.
+    """
+    has_child = set(parent_indices)            # every value here is some node's parent
+    return [i for i in range(len(parent_indices)) if i not in has_child]
+
+
+def build_tree_candidates_calibrated(head_logits, tree_spec):
+    """
+    Build the flat node list for a pre-calibrated tree topology.
+
+    Same output contract as build_tree_candidates (tokens + parent_indices), but instead of a
+    uniform Cartesian product the *shape* is fixed ahead of time by calibration (which head/rank
+    each node uses), so the node budget is spent only on high-probability candidates.
+
+    head_logits: list of tensors, one per tree depth, each shape [vocab_size]
+    tree_spec:   list of (depth, rank, parent_idx), ONE per node, ordered so a parent always
+                 precedes its children. depth indexes head_logits; rank is the top-k slot to take.
+
+    Returns: tokens, parent_indices  (drop-in for the decoder).
+    """
+    # how many top tokens we need from each depth (the max rank used at that depth, +1)
+    max_rank = {}
+    for depth, rank, _ in tree_spec:
+        max_rank[depth] = max(max_rank.get(depth, 0), rank + 1)
+    topk_at_depth = {d: torch.topk(head_logits[d], r).indices.tolist() for d, r in max_rank.items()}
+
+    tokens = []
+    parent_indices = []
+    for depth, rank, parent_idx in tree_spec:
+        tokens.append(topk_at_depth[depth][rank])
+        parent_indices.append(parent_idx)
+    return tokens, parent_indices
+
 def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, profile=False):
     device = next(medusa.backbone.parameters()).device
 
@@ -457,7 +497,8 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
 
 
 def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None, return_ids=False,
-                             accept_mode="greedy", temperature=1.0, epsilon=0.3, delta=0.09, on_token=None):
+                             accept_mode="greedy", temperature=1.0, epsilon=0.3, delta=0.09, on_token=None,
+                             tree_spec=None):
     """
     Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
 
@@ -513,7 +554,11 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
 
         # BUILD TREE from seed_h using heads 1..K-1 (head 0 predicts the already-known pending).
         head_logits = [medusa.heads[k](seed_h)[:].reshape(-1) for k in range(1, K)]
-        tokens, parent_indices = build_tree_candidates(head_logits=head_logits, width=width)
+        if tree_spec is not None:
+            # calibrated topology: same node budget, spent on high-probability candidates
+            tokens, parent_indices = build_tree_candidates_calibrated(head_logits, tree_spec)
+        else:
+            tokens, parent_indices = build_tree_candidates(head_logits=head_logits, width=width)
         tree_mask = build_tree_mask(parent_indices=parent_indices)
         num_nodes = len(tokens)
 
@@ -599,15 +644,16 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
                 print(f"  last 6 committed tokens: {generated[0, -6:].tolist()} -> {tokenizer.decode(generated[0, -6:])!r}")
                 return tokenizer.decode(generated[0], skip_special_tokens=True)
 
-        # FIND BEST PATH
-        leaf_start = num_nodes - width**tree_depth
+        # FIND BEST PATH — enumerate every root-to-leaf path. Generic leaf detection so this
+        # works for both the Cartesian tree and a calibrated topology (leaves at any depth).
+        leaves = tree_leaves(parent_indices)
 
         if accept_mode == "greedy":
             # STRICT GREEDY (default, verified): emit the backbone's argmax; accept a tree branch
             # only while each candidate exactly equals that argmax. Output == plain greedy decode.
             best_accepted = []
             best_path_nodes = []
-            for leaf in range(leaf_start, num_nodes):
+            for leaf in leaves:
                 path = []
                 node = leaf
                 while node != -1:
@@ -649,7 +695,7 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
 
             best_cands = []      # accepted candidate tokens (no bonus yet)
             best_path_nodes = []
-            for leaf in range(leaf_start, num_nodes):
+            for leaf in leaves:
                 path = []
                 node = leaf
                 while node != -1:
