@@ -16,7 +16,9 @@ Implements three inference strategies on Llama models, measures the speedup, and
 
 **Speculative decoding** runs a small draft model to propose K tokens at once, then verifies all K in a single pass of the big target model. If the draft was right, you get K tokens for roughly the price of one. If it was wrong, you get one corrected token and try again. The output is mathematically identical to running the big model alone.
 
-**Medusa** takes this further by replacing the separate draft model with small MLP heads attached directly to the frozen backbone. The heads predict future tokens from the same hidden state the backbone already computed, so there is no second model to run. With tree attention (implemented here), the heads propose a tree of candidate paths that get verified in one pass instead of three.
+**Medusa** takes this further by replacing the separate draft model with small MLP heads attached directly to the frozen backbone. The heads predict future tokens from the same hidden state the backbone already computed, so there is no second model to run. With tree attention, the heads propose a tree of candidate paths that get verified in one pass instead of three.
+
+The main contribution here is a **calibrated candidate tree**: measure each head's prediction accuracy offline, then allocate a fixed node budget to the most-likely-accepted guesses by Prim's-style greedy selection. The optimizer automatically drops the weakest head, lifting the **lossless** speedup from 1.24× to 1.34–1.56× at the same compute budget.
 
 ---
 
@@ -89,12 +91,14 @@ Medusa (tree attention):
 
 ## How to run
 
-Install dependencies:
+Requires a CUDA GPU (the 8B baseline needs ~16 GB VRAM; the Medusa path ~18 GB), Python 3.10+, and HuggingFace access to the gated Llama models.
+
 ```bash
 pip install -r requirements.txt
+huggingface-cli login        # the Llama models are gated — accept the license, then log in
 ```
 
-You need HuggingFace access to `meta-llama/Llama-3.2-1B-Instruct` and `meta-llama/Llama-3.1-8B-Instruct`.
+**Checkpoints:** the trained Medusa head weights (`*.pt`) are *not* in the repo (gitignored — large binaries). Reproduce them with the training script below, or the Medusa scripts won't load. The naive baseline and the 1B-draft speculative path run without any checkpoint.
 
 **Naive baseline:**
 ```bash
@@ -111,15 +115,30 @@ PYTHONPATH=. python scripts/k_sweep.py
 PYTHONPATH=. python scripts/benchmark_medusa.py
 ```
 
-**Tree attention benchmark:**
+**Lossless check + fused/typical benchmarks** (need a checkpoint):
 ```bash
-PYTHONPATH=. python scripts/test_medusa_tree.py
+PYTHONPATH=. python scripts/verify_fused.py            # self-consistency: 1.24x, lossless
+TEMP=0.8 PYTHONPATH=. python scripts/test_typical.py   # typical acceptance, ~1.47x coherent
 ```
 
-**FastAPI server + frontend:**
+**Calibrated tree — Extension A, the original contribution** (needs a checkpoint):
 ```bash
-PYTHONPATH=. python scripts/run_server.py   # terminal 1
-# open frontend/index.html in browser, update the server IP if running remotely
+PYTHONPATH=. python scripts/calibrate_tree.py          # calibrate, then Cartesian vs calibrated (1.34–1.56x)
+```
+
+**Live demo (FastAPI + WebSocket, colour-coded tokens):**
+```bash
+# terminal 1, on the GPU box — loads 8B + heads, serves on :8000
+PYTHONPATH=. python scripts/run_server.py
+```
+If your browser is on a different machine than the server, forward the port and open the page locally:
+```bash
+ssh -L 8000:localhost:8000 <user>@<gpu-host>     # from your laptop; keep this open
+# then open frontend/index.html in your browser → pick "Medusa" → Generate
+```
+No-browser smoke test (prints accept-tagged tokens + acceptance %):
+```bash
+PYTHONPATH=. python scripts/test_server.py
 ```
 
 ---
@@ -128,25 +147,31 @@ PYTHONPATH=. python scripts/run_server.py   # terminal 1
 
 ```
 src/
-  models.py       model loader (handles float16, device placement, eval mode)
+  models.py       model loader (float16, device placement, eval mode)
   sampler.py      naive_generate, speculative_decode, rejection sampling
-  medusa.py       MedusaHead, MedusaModel, medusa_decode, medusa_decode_tree,
-                  build_tree_candidates, build_tree_mask
-  server.py       FastAPI server (POST /generate, WS /stream)
+  medusa.py       MedusaHead, MedusaModel; decoders: medusa_decode,
+                  medusa_decode_tree, medusa_decode_tree_fused (1 pass/round);
+                  tree builders incl. build_tree_candidates_calibrated (Extension A)
+  server.py       FastAPI server (POST /generate, WS /stream with live token coloring)
 
 scripts/
-  baseline_bench.py       measure naive tok/s
-  compare_speed.py        naive vs speculative head to head
-  k_sweep.py              sweep K from 1 to 8
-  benchmark_medusa.py     three-way benchmark table
-  test_medusa_tree.py     tree attention correctness check + benchmark
-  train_medusa.py         toy training script (1B, for sanity checks)
-  train_medusa_8b.py      real training (8B, UltraChat 10k/25k)
-  run_server.py           load model and start uvicorn
-  test_server.py          test both server endpoints
+  baseline_bench.py    measure naive tok/s (the 1.00x floor)
+  compare_speed.py     naive vs 1B-draft speculative
+  k_sweep.py           sweep K from 1 to 8 (find optimal K)
+  profile_tree.py      phase-by-phase profile (shows the backbone passes dominate)
+  width_sweep.py       why a wider tree doesn't help under greedy
+  verify_fused.py      self-consistency lossless test (101/101 argmax-or-tied)
+  test_typical.py      greedy vs typical + temperature sweep (TEMP=, PROMPT= env)
+  calibrate_tree.py    Extension A: calibrate, then Cartesian vs calibrated tree
+  train_medusa_8b.py   real training (8B, UltraChat)
+  run_server.py        load model + heads, start uvicorn
+  test_server.py       smoke-test both endpoints (naive + medusa)
 
 frontend/
-  index.html      token visualization UI (vanilla JS, no framework)
+  index.html      token visualization UI (vanilla JS, naive/medusa toggle)
+
+report/
+  report.tex      full technical report (the calibrated tree is the contribution)
 ```
 
 ---
@@ -164,6 +189,18 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. python scripts/tra
 ```
 
 Heads are saved as `medusa_heads_8b_epoch{n}.pt`. Not included in the repo (too large), but the training script reproduces them.
+
+---
+
+## What's next
+
+- **Adaptive draft depth** — adjust tree depth online from a sliding window of recent acceptance (deeper on predictable text, shallower on hard text): the online version of what the calibrated tree solves offline.
+- **Per-context calibration** — recalibrate the tree topology by domain (code vs. prose) instead of one global topology.
+- **Batched speculative decoding** — verify many sequences' trees in one pass, for throughput under concurrent load.
+- **MT-Bench quality eval** — formally quantify the typical path's quality cost (the greedy paths are already provably lossless).
+- **Public deployment** — host the live visualization behind a small GPU.
+
+Full method, math, and results are in [`report/report.tex`](report/report.tex).
 
 ---
 
