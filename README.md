@@ -103,7 +103,11 @@ pip install -r requirements.txt
 huggingface-cli login        # the Llama models are gated — accept the license, then log in
 ```
 
-**Checkpoints:** the trained Medusa head weights (`*.pt`) are *not* in the repo (gitignored — large binaries). Reproduce them with the training script below, or the Medusa scripts won't load. The naive baseline and the 1B-draft speculative path run without any checkpoint.
+**Pretrained heads:** the Medusa head weights aren't committed to the repo (large binaries), but the trained 4-head checkpoint is on the Hub — download it instead of training:
+```bash
+huggingface-cli download prashantgautam8077/specdecode-medusa-heads medusa_heads_8b_epoch4.pt --local-dir .
+```
+This drops `medusa_heads_8b_epoch4.pt` in the repo root, where the Medusa scripts expect it. (Or train your own — see below.) The naive baseline and the 1B-draft speculative path need no checkpoint.
 
 **Naive baseline:**
 ```bash
@@ -195,7 +199,7 @@ PYTHONPATH=. python scripts/train_medusa.py
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. python scripts/train_medusa_8b.py
 ```
 
-Heads are saved as `medusa_heads_8b_epoch{n}.pt`. Not included in the repo (too large), but the training script reproduces them.
+Heads are saved as `medusa_heads_8b_epoch{n}.pt`. Not committed to the repo (too large), but the final 4-head checkpoint is on the Hub: [prashantgautam8077/specdecode-medusa-heads](https://huggingface.co/prashantgautam8077/specdecode-medusa-heads) — download it (see "Pretrained heads" above) or reproduce it with the script.
 
 ---
 
