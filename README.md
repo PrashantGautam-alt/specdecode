@@ -1,7 +1,8 @@
 # SpecDecode
 
-Built this to understand speculative decoding from first principles, not just run someone else's implementation.
-Implements three inference strategies on Llama models, measures the speedup, and visualizes what is actually happening at the token level.
+A speculative-decoding inference accelerator for Llama-3.1-8B, built from scratch to understand every line — not to wrap someone else's implementation.
+
+It reaches **up to 1.56× lossless** speedup over autoregressive decoding (and ~1.47× under typical acceptance), with an original contribution: a **calibrated candidate tree** that spends a fixed compute budget on the guesses most likely to be accepted. Includes a live, colour-coded token-streaming demo.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue) ![PyTorch](https://img.shields.io/badge/PyTorch-2.12-red)
 
@@ -73,20 +74,22 @@ Speculative decoding:
                     accepted tokens (output = exact 8B greedy)
 
 
-Medusa (tree attention):
+Medusa (fused tree — the path behind the headline results):
 
   [Llama 8B backbone] -->  hidden state h
                                |
               +----------------+----------------+
               |                |                |
-           head 0           head 1           head 2  ...
-         (top-2 at t+1)  (top-2 at t+2)  (top-2 at t+3)
+           head 1           head 2           head 3
+         (t+2 guess)      (t+3 guess)      (t+4 guess)
               |
-     tree of candidates (30 nodes, 16 paths for K=4, width=2)
+     candidate tree, verified in ONE backbone pass with a
+     custom attention mask (PROPOSE folded into VERIFY)
               |
-     one backbone pass with custom attention mask
+     calibrated tree: same node budget, spent on the guesses
+     most likely to be accepted  (the contribution)
               |
-     longest matching path wins
+     longest matching path wins  -->  output = exact 8B greedy
 ```
 
 ---
@@ -112,10 +115,11 @@ PYTHONPATH=. python scripts/baseline_bench.py
 PYTHONPATH=. python scripts/k_sweep.py
 ```
 
-**Three-way benchmark (naive vs SpecDecode vs Medusa):**
+**Three-way benchmark (naive vs SpecDecode vs *early* Medusa):**
 ```bash
-PYTHONPATH=. python scripts/benchmark_medusa.py
+PYTHONPATH=. python scripts/benchmark_medusa.py   # early 3-pass Medusa (0.65x)
 ```
+> This is the early, slow 3-pass Medusa. The fast lossless path is `verify_fused.py` and `calibrate_tree.py` below.
 
 **Lossless check + fused/typical benchmarks** (need a checkpoint):
 ```bash
