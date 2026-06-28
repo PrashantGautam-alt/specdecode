@@ -27,9 +27,10 @@ Target model: Llama-3.1-8B-Instruct
 Draft model: Llama-3.2-1B-Instruct
 
 **Headline (two numbers, honest about the tradeoff):**
-- **1.24x — lossless.** 4-head Medusa with a fused tree decoder under strict-greedy acceptance is
-  provably bit-identical to standard greedy decoding (verified by self-consistency, 101/101 tokens
-  argmax-or-tied). No quality cost at all.
+- **1.24–1.56x — lossless.** 4-head Medusa with a fused tree decoder under strict-greedy acceptance
+  is provably bit-identical to standard greedy decoding (verified by self-consistency, 101/101 tokens
+  argmax-or-tied). The **calibrated tree** (Extension A) lifts the base 1.24x to 1.34–1.56x by
+  spending the node budget on high-probability candidates — still zero quality cost.
 - **~1.47x — with typical acceptance (T=0.8).** Trades exact-greedy for a looser accept rule.
   Coherent across prompt types but *lossy* (temperature sampling, not identical to greedy).
 
@@ -41,6 +42,7 @@ Draft model: Llama-3.2-1B-Instruct
 | **Medusa 4-head, fused tree, greedy** | **47.0** | **1.24x** | **lossless — bit-identical to greedy decoding** |
 | Medusa 6-head, fused tree, greedy | 43.3 | 1.14x | *slower*: far heads rejected under strict greedy (optimal-K overshoot) |
 | **Medusa 4-head, fused tree, typical (T=0.8)** | **~55** | **~1.47x** | coherent, lossy; 1.27–1.67x across prompt types |
+| **Medusa 4-head, calibrated tree, greedy** | **50.7–58.8** | **1.34–1.56x** | **lossless**; +6–15% acceptance over Cartesian, same node budget |
 
 Two findings worth understanding from this table:
 - **More heads can make greedy slower.** 6 heads (1.14x) underperform 4 heads (1.24x) under strict
