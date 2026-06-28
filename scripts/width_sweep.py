@@ -44,7 +44,7 @@ if __name__ == "__main__":
 
     medusa = MedusaModel(backbone, num_heads=K)
     # heads in float16 on cuda:0 (same setup as the main benchmark — no cross-GPU transfer)
-    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:0"))
+    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cpu"))
     medusa.heads.to(device="cuda:0", dtype=torch.float16)
     medusa.heads.eval()
     print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)\n")

@@ -24,7 +24,7 @@ if __name__ == "__main__":
     tokenizer = loader.tokenizer
 
     medusa = MedusaModel(backbone, num_heads=K)
-    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:0"))
+    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cpu"))
     medusa.heads.to(device="cuda:0", dtype=torch.float16)
     medusa.heads.eval()
     print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)\n")

@@ -40,7 +40,7 @@ if __name__ == "__main__":
     # heads to ~4.3 GB, so everything fits on cuda:0 — killing the per-round cuda:0->cuda:1 transfer
     # of the hidden state h. Correctness is unaffected: heads only PROPOSE; the backbone VERIFIES,
     # so worse float16 guesses can only lower acceptance, never change the output.
-    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cuda:0"))
+    medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cpu"))
     medusa.heads.to(device="cuda:0", dtype=torch.float16)
     medusa.heads.eval()
     print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)")
