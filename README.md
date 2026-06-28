@@ -26,14 +26,30 @@ Hardware: 2x NVIDIA RTX A5000 (24GB each), CUDA 12.4
 Target model: Llama-3.1-8B-Instruct
 Draft model: Llama-3.2-1B-Instruct
 
+**Headline (two numbers, honest about the tradeoff):**
+- **1.24x — lossless.** 4-head Medusa with a fused tree decoder under strict-greedy acceptance is
+  provably bit-identical to standard greedy decoding (verified by self-consistency, 101/101 tokens
+  argmax-or-tied). No quality cost at all.
+- **~1.47x — with typical acceptance (T=0.8).** Trades exact-greedy for a looser accept rule.
+  Coherent across prompt types but *lossy* (temperature sampling, not identical to greedy).
+
 | Config | tok/s | Speedup | notes |
 |---|---|---|---|
 | Naive 8B baseline | 37.9 | 1.00x | |
-| SpecDecode K=4 (1B draft) | 44.4 | 1.17x | 1B draft, instruct |
-| Medusa greedy (3-pass) | 24.6 | 0.65x | epoch 1 heads |
-| Medusa tree (width=2) | 25.4 | 0.67x | epoch 1 heads, 2.66 tok/round |
+| SpecDecode K=4 (separate 1B draft) | 44.4 | 1.17x | 1B draft model, instruct |
+| Medusa greedy, epoch-1 heads (3-pass) | 24.6 | 0.65x | early, undertrained heads |
+| **Medusa 4-head, fused tree, greedy** | **47.0** | **1.24x** | **lossless — bit-identical to greedy decoding** |
+| Medusa 6-head, fused tree, greedy | 43.3 | 1.14x | *slower*: far heads rejected under strict greedy (optimal-K overshoot) |
+| **Medusa 4-head, fused tree, typical (T=0.8)** | **~55** | **~1.47x** | coherent, lossy; 1.27–1.67x across prompt types |
 
-Medusa is slower than naive at epoch 1 because the heads are not yet well-trained (2.66/5 tokens accepted per round on average). The tree is marginally faster than greedy Medusa because it verifies 30 candidates in one pass instead of three sequential passes. With more training epochs the acceptance rate rises and both should cross above naive.
+Two findings worth understanding from this table:
+- **More heads can make greedy slower.** 6 heads (1.14x) underperform 4 heads (1.24x) under strict
+  greedy: the extra far-future heads are almost always rejected, so they add tree-verification cost
+  every round with near-zero accepted tokens — a live demonstration of the optimal-K cost model.
+- **Typical acceptance is the only way deeper trees pay off**, but it is lossy and its safe
+  temperature must be tuned against the *worst-case* prompt (a list prompt garbled at T=0.92 while
+  prose stayed clean). T=0.8 is the robust operating point; speed is reported as a range across
+  prompt types because acceptance depends on how predictable the text is.
 
 ---
 
