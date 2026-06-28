@@ -3,6 +3,7 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath, amssymb}
 \usepackage{graphicx}
+\graphicspath{{figures/}{report/figures/}}  % find figures whether compiling from report/ or repo root
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage{xcolor}
@@ -209,6 +210,13 @@ K & tok/s & Speedup & Avg tokens/round & Predicted speedup \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{k_sweep.png}
+\caption{Speedup peaks at $K{=}4$ even though acceptance keeps rising with $K$: the certain,
+linear draft cost eventually overtakes the diminishing, conditional acceptance gain.}
+\end{figure}
 
 K=4 is optimal because draft cost grows linearly and unconditionally (+0.40 per
 draft token regardless of acceptance), while acceptance gains are sublinear and
@@ -479,6 +487,13 @@ Tea (list)  & 1.92 tok/round, 51.0 tok/s & 2.22 tok/round, 58.8 tok/s & +15\% \\
 \end{tabular}
 \end{table}
 
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.7\textwidth]{calibrated_vs_cartesian.png}
+\caption{At the same 14-node budget, the calibrated tree accepts more tokens per round than the
+uniform Cartesian tree, by spending the budget on the most-likely-accepted candidates.}
+\end{figure}
+
 The calibrated tree lifts the lossless speedup from 1.24x to \textbf{1.34--1.56x} with no
 temperature, no retraining, and no quality cost -- purely by spending the same budget more
 wisely.
@@ -505,6 +520,13 @@ Medusa 4-head, typical, $T{=}0.8$ & $\sim$1.47x & coherent (lossy) \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{results_ladder.png}
+\caption{Speedup by configuration. Blue: lossless. Green: the calibrated tree (the
+contribution), also lossless. Orange: typical acceptance (lossy). Red: slower than baseline.}
+\end{figure}
 
 % ---------------------------------------------------------------
 \section{System}

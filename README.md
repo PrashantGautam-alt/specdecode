@@ -28,6 +28,8 @@ Hardware: 2x NVIDIA RTX A5000 (24GB each), CUDA 12.4
 Target model: Llama-3.1-8B-Instruct
 Draft model: Llama-3.2-1B-Instruct
 
+![Speedup ladder](report/figures/results_ladder.png)
+
 **Headline (two numbers, honest about the tradeoff):**
 - **1.24–1.56x — lossless.** 4-head Medusa with a fused tree decoder under strict-greedy acceptance
   is provably bit-identical to standard greedy decoding (verified by self-consistency, 101/101 tokens
@@ -166,6 +168,7 @@ scripts/
   train_medusa_8b.py   real training (8B, UltraChat)
   run_server.py        load model + heads, start uvicorn
   test_server.py       smoke-test both endpoints (naive + medusa)
+  make_figures.py      regenerate the report/README charts (no GPU needed)
 
 frontend/
   index.html      token visualization UI (vanilla JS, naive/medusa toggle)

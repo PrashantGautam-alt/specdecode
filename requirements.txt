@@ -6,4 +6,5 @@ fastapi
 uvicorn
 websockets
 requests
+matplotlib
 sentence-transformers
