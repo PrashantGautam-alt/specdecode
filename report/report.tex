@@ -68,15 +68,25 @@
         \noindent
         Large language models generate text one token at a time, with each token
         requiring a full forward pass of the target model. This sequential dependency
-        is the fundamental throughput bottleneck at inference time.
-        This project implements two techniques that attack this bottleneck from
-        different angles -- speculative decoding and Medusa -- building both from
-        scratch on Llama 3.1/3.2 models and measuring the speedup on a 2x RTX A5000
-        GPU setup. Speculative decoding with K=4 achieves a 1.17x speedup over the
-        8B baseline. Medusa with a greedy 3-pass implementation runs at 0.69x due to
-        per-round overhead; tree attention (implemented but not yet benchmarked due to
-        server downtime) is expected to bring this above 1.5x by collapsing three
-        backbone passes into one.
+        is the fundamental throughput bottleneck at inference time. This project
+        implements two families of acceleration from scratch on Llama 3.1/3.2 models
+        and measures every result on an RTX A5000 (24\,GB): classical speculative
+        decoding with a separate draft model, and Medusa, where small heads on the
+        frozen backbone predict several future tokens at once. Speculative decoding
+        with $K{=}4$ reaches 1.17x. The Medusa path is driven through a sequence of
+        structural optimizations -- candidate \emph{tree} attention, a \emph{fused}
+        single-pass decoder, and \emph{typical} acceptance -- reaching a provably
+        \textbf{lossless 1.24x} (verified by a self-consistency test, not a fragile
+        bit-match, because fp16 ties make exact matching meaningless) and a coherent
+        \textbf{1.47x} under typical acceptance. The central contribution is a
+        \textbf{calibrated candidate tree}: per-head prediction accuracies are
+        measured offline and a fixed node budget is allocated by Prim's-style greedy
+        selection over path probability. The optimizer \emph{automatically} drops the
+        weakest head (assigning it zero nodes -- an emergent re-derivation of the
+        optimal-$K$ result), lifting the lossless speedup to \textbf{1.34--1.56x} at
+        the same compute budget. A FastAPI + WebSocket service streams tokens to a
+        browser, colour-coded live by whether each token was a confirmed speculative
+        guess or a backbone correction.
     \end{abstract}
 \end{titlepage}
 
@@ -264,10 +274,13 @@ Naive 8B baseline & & 37.9 & 1.00x \\
 SpecDecode K=4 & 1B instruct draft & 44.4 & 1.17x \\
 Medusa greedy (float32 heads) & epoch1 checkpoint & 24.6 & 0.65x \\
 Medusa greedy (float16 heads) & epoch1 checkpoint & 26.4 & 0.69x \\
-Medusa tree attention (width=2) & pending & -- & -- \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+This first Medusa implementation is \emph{slower} than the naive baseline. The next
+section explains why (it is structural, not a tuning problem), and the sections after
+that remove the bottleneck and turn Medusa into the project's fastest configuration.
 
 % ---------------------------------------------------------------
 \section{Why Greedy Medusa is Slow: The 3-Pass Problem}
@@ -324,14 +337,174 @@ The full attention mask has shape $[1, N, L + N]$ where $L$ is the context lengt
 and $N = 30$. The left $L$ columns are all ones (every candidate can see the full
 context). The right $N \times N$ block is the tree mask built from parent indices.
 
-\subsection{Expected Gain}
+\subsection{Result}
 
-With 1 pass instead of 3 and the same 2.22 tokens/round acceptance:
+Tree attention with strict-greedy acceptance is lossless and removes the verification
+redundancy, but on its own it still pays for a separate PROPOSE pass. The decisive step is
+fusing PROPOSE into VERIFY (next section), after which the tree decoder becomes the
+project's fastest lossless configuration.
+
+% ---------------------------------------------------------------
+\section{The Fused Single-Pass Decoder}
+% ---------------------------------------------------------------
+
+The standalone PROPOSE pass existed only to produce a fresh hidden state $h$ for the heads.
+But the VERIFY pass already computes a hidden state at \emph{every} tree node, and these were
+being discarded. The fused decoder keeps them: the hidden state at this round's last accepted
+node is exactly what the heads need to build the \emph{next} round's tree. This folds PROPOSE
+into VERIFY and absorbs the cache update, giving \textbf{one backbone pass per round}.
+
+Fusion did not double the speed (1.19x $\to$ 1.24x). The fused pass prepends the already-known
+pending token, which consumes head~0, so the fused tree has depth $K-1$ instead of $K$ -- one
+fewer level of guesses. On a memory-bound model a backbone pass is worth roughly one tree
+level, so removing a pass while losing a level nearly cancels. The real unlock is therefore
+\emph{more heads}, so a fused tree can be deep and still cost one pass.
+
+% ---------------------------------------------------------------
+\section{Correctness Under fp16: Ties and Self-Consistency}
+% ---------------------------------------------------------------
+
+The fused output disagreed with HuggingFace greedy on a single token (`` describes'' vs.\
+`` explains''). This was first chased as a cache bug, but a fresh cacheless recompute matched
+the cached result -- the cache was correct. The true cause was a near-\emph{tie}: the two
+tokens had logits $19.640$ and $19.625$. The argmax of a tie is computed in different
+floating-point reduction orders by a \emph{prefill} pass (parallel over many positions, as the
+fused decoder runs) versus a \emph{decode} pass (one token at a time, as HuggingFace greedy
+runs); in float16 the last-digit rounding differs and flips the tie.
+
+The consequence is methodological: the fused decoder produces a \emph{valid} greedy decode, but
+not one that is bit-identical to an incremental reference. Correctness is therefore tested by
+\textbf{self-consistency}: take the fused output, run one clean forward pass over it, and
+confirm every committed token is the model's argmax or tied for it within a tiny logit gap.
+Result: \textbf{101 / 101 tokens argmax-or-tied}, largest gap $0.0000$ -- the output is provably
+a valid greedy decode. Lossless, at \textbf{1.24x}.
+
+\textit{A safety corollary used throughout:} the heads only \emph{propose}; the backbone
+\emph{verifies and emits}. A worse (fp16) head guess can only be rejected, never emitted. Head
+precision is therefore purely a speed knob and cannot affect correctness -- which is why moving
+the heads to float16 was provably safe.
+
+% ---------------------------------------------------------------
+\section{Typical Acceptance and Temperature}
+% ---------------------------------------------------------------
+
+Strict greedy accepts a candidate only if it equals the backbone's argmax, so wider or deeper
+trees do not help under it -- the extra branches encode non-argmax guesses greedy never takes.
+\emph{Typical} acceptance \cite{cai2024} instead accepts a candidate when it is plausible under
+the backbone's distribution,
 \[
-    \text{speedup} \approx \frac{2.22}{1} \approx 2.2\text{x}
+p(\text{cand}) > \min\!\big(\varepsilon,\ \delta\, e^{-H(p)}\big),
 \]
-In practice, the tree pass processes 30 tokens (more compute than 1), so the real
-expected speedup is 1.5--2.0x. Benchmark pending.
+where $H(p)$ is the entropy of the backbone's distribution: when the model is unsure the
+threshold drops and more candidates pass. This is lossy (it is temperature sampling, not
+greedy) but lets deeper and wider trees finally pay off.
+
+Temperature is the knob. Lower $T$ sharpens the distribution and accepts only confident tokens
+(coherent, fewer accepts); higher $T$ accepts more but eventually degrades into incoherent text.
+This is a constrained optimization -- maximize speed subject to the output staying coherent --
+whose optimum sits on the constraint boundary (the highest $T$ that is still coherent). Two
+findings: (i) the safe temperature must be tuned against the \emph{worst} prompt, not an average
+one ($T{=}0.92$ was coherent on a physics prompt but produced word-salad on a simple list);
+(ii) $T{=}0.8$ is robust across prompt types, giving a coherent $\sim$\textbf{1.47x} (1.27--1.67x
+by prompt).
+
+% ---------------------------------------------------------------
+\section{More Heads Can Be Slower: Optimal-\texorpdfstring{$K$}{K}, Measured}
+% ---------------------------------------------------------------
+
+A six-head checkpoint was trained to deepen the fused tree. Under strict greedy it was
+\emph{slower} than four heads (1.14x vs.\ 1.24x). The two far-future heads are almost always
+wrong, so under greedy they are almost always rejected -- contributing near-zero extra accepted
+tokens while still adding tree-verification cost every round. This is the optimal-$K$ tradeoff
+(linear, certain cost versus diminishing, conditional acceptance) shown directly on hardware:
+past the optimal head count, more heads cost more than they return. The far heads can only earn
+their place under typical acceptance, or by spending the budget intelligently -- the subject of
+the next section.
+
+% ---------------------------------------------------------------
+\section{Calibrated Tree Attention (Original Contribution)}
+% ---------------------------------------------------------------
+
+\subsection{The Problem}
+The Cartesian tree spends its node budget uniformly: top-2 of every head, every combination
+($2+4+8 = 14$ nodes at depths $0,1,2$ for the fused tree, allocated $[2,4,8]$). But the heads
+are not equally accurate. Calibration measured the best-guess accuracy of each head as
+$21.8\%$, $10.5\%$, $7.3\%$ by depth. The naive tree therefore spends \emph{eight of fourteen
+nodes} -- the majority -- on the worst head's guesses, which are almost always rejected.
+
+\subsection{Calibration}
+For each tree depth $d$ (which uses head $d{+}1$) and rank $i$, the accuracy
+\[
+a[d][i] = \Pr\big[\text{head } (d{+}1)\text{'s rank-}i \text{ token equals the true future token}\big]
+\]
+is estimated on \emph{in-distribution} text -- the model's own greedy continuations of several
+prompts -- by applying each head at every position and counting matches against the realized
+future token. Accuracy decreases with both depth (further future is harder) and rank.
+
+\subsection{Greedy Node Selection}
+A candidate node at depth $d$ reached by rank choices $(i_0,\dots,i_d)$ has path-acceptance
+probability equal to the product of accuracies along it,
+$P(\text{node}) = \prod_{j=0}^{d} a[j][i_j]$. With a fixed budget $B$ (set to 14, matching the
+Cartesian tree), nodes are selected greedily: maintain a frontier of nodes whose parent is
+already chosen, repeatedly add the highest-$P$ frontier node and push its children, until $B$
+nodes are selected. \textbf{This is Prim's minimum-spanning-tree algorithm} -- grow a tree by
+attaching the best-connected frontier node -- with the objective changed from minimizing edge
+cost to maximizing cumulative acceptance. Because a child becomes a candidate only after its
+parent is chosen, parents precede children, exactly the ordering the decoder requires; the
+topology is computed once and stored.
+
+One decoder change supports it: the Cartesian tree's leaves are always its last
+$\text{width}^{\text{depth}}$ nodes, but a calibrated tree's leaves can sit at any depth, so
+leaves are detected generically (a node that is nobody's parent). The accept rule is unchanged,
+so the calibrated greedy path is lossless \emph{by construction} -- the tree only changes which
+guesses are proposed, never which token is emitted.
+
+\subsection{Result: the Optimizer Re-discovers Optimal-\texorpdfstring{$K$}{K}}
+With 14 nodes, greedy selection allocated $[4, 10, 0]$ across depths -- assigning \textbf{zero
+nodes to the weakest head}. Its best guess ($7.3\%$) was too unlikely to be accepted to justify
+even one node over a fourth node on the best head. The optimization thus \emph{automatically}
+re-derived the optimal-$K$ result of the previous section, with no human intervention. At the
+same node budget, greedy and lossless:
+
+\begin{table}[H]
+\centering
+\caption{Cartesian vs.\ calibrated tree (greedy, lossless), same 14-node budget.}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Prompt & Cartesian & Calibrated & Acceptance gain \\
+\midrule
+Relativity & 1.81 tok/round, 47.5 tok/s & 1.91 tok/round, 50.7 tok/s & +6\% \\
+Tea (list)  & 1.92 tok/round, 51.0 tok/s & 2.22 tok/round, 58.8 tok/s & +15\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The calibrated tree lifts the lossless speedup from 1.24x to \textbf{1.34--1.56x} with no
+temperature, no retraining, and no quality cost -- purely by spending the same budget more
+wisely.
+
+% ---------------------------------------------------------------
+\section{Results Summary}
+% ---------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Full results ladder. Llama 3.1 8B Instruct, RTX A5000, 100 tokens.}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & Speedup & Quality \\
+\midrule
+Naive 8B baseline & 1.00x & -- \\
+SpecDecode, 1B draft, $K{=}4$ & 1.17x & lossless (distribution) \\
+Medusa greedy, epoch-1 (3-pass) & 0.65x & lossless \\
+Medusa 4-head, fused tree, greedy & 1.24x & lossless \\
+Medusa 6-head, fused tree, greedy & 1.14x & lossless (optimal-$K$ overshoot) \\
+Medusa 4-head, typical, $T{=}1.0$ & 1.76x & incoherent \\
+Medusa 4-head, typical, $T{=}0.8$ & $\sim$1.47x & coherent (lossy) \\
+\textbf{Medusa 4-head, calibrated tree, greedy} & \textbf{1.34--1.56x} & \textbf{lossless} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ---------------------------------------------------------------
 \section{System}
@@ -374,6 +547,44 @@ NaN from epoch 0. The softmax over 128,256 tokens computes $e^{x}$ for logit $x$
 at early training, logits for some tokens exceed 11 and $e^{11} \approx 60,000$,
 which overflows float16's maximum of 65,504. The fix is mixed precision: backbone
 stays float16 (no gradients), heads train in float32.
+
+\textbf{Correctness testing under fp16 must not be bit-exact.} A near-tie in the
+logits resolves to different argmaxes depending on the reduction order of the
+forward pass (prefill vs.\ decode). A decoder can be a perfectly valid greedy decode
+yet differ from a reference implementation token-for-token. The right correctness
+test is self-consistency (is every emitted token argmax-or-tied?), not equality to a
+reference -- a subtle point that took a full debugging session to learn.
+
+\textbf{An optimizer can re-derive a hand-found result.} The optimal-$K$ tradeoff
+was first observed by hand: a sixth head made greedy slower. The calibrated tree's
+greedy node-selection then re-derived it automatically, assigning zero nodes to the
+weakest head. Framing the tree construction as ``maximize expected accepted tokens
+subject to a node budget'' turned a heuristic into an explicit optimization whose
+solution \emph{contained} the insight -- the most satisfying moment of the project,
+and the clearest place where the operations-research framing paid off.
+
+% ---------------------------------------------------------------
+\section{What I Would Do Next}
+% ---------------------------------------------------------------
+
+\begin{itemize}
+    \item \textbf{Adaptive draft length.} Treat the head count / tree depth as a control
+          variable adjusted online from a sliding window of recent acceptance, increasing it
+          on predictable text and shrinking it on hard text. This is the same throughput
+          optimization that the calibrated tree solves \emph{offline}, made \emph{online} --
+          a natural operations-research extension.
+    \item \textbf{Online / per-context calibration.} The calibration here is global. Accuracy
+          varies by domain (code vs.\ prose); recalibrating the tree topology per context, or
+          maintaining a few topologies and selecting by prompt type, should add acceptance.
+    \item \textbf{Batched speculative decoding.} Verifying trees for many sequences in one
+          backbone pass, to raise throughput under concurrent load -- the production setting.
+    \item \textbf{MT-Bench quality evaluation.} The greedy paths are lossless by construction
+          and verified by self-consistency; the typical path is lossy, and a formal MT-Bench
+          comparison would quantify its quality cost against the speed gain.
+    \item \textbf{Public deployment.} Host the live visualization behind a small GPU so the
+          colour-coded token stream is reachable from a URL (benchmark numbers remain those
+          measured on the A5000).
+\end{itemize}
 
 % ---------------------------------------------------------------
 \section{References}
