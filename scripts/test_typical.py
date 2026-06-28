@@ -28,7 +28,9 @@ WIDTH = 2
 # distribution -> only confident tokens clear the threshold -> more coherent but
 # fewer accepts. Read from env so the sweep needs no re-edit: TEMP=0.7 python ...
 TEMPERATURE = float(os.environ.get("TEMP", "1.0"))
-PROMPT = "Explain the theory of relativity in simple terms:"
+# PROMPT swappable via env so coherence/speed can be spot-checked across prompt
+# types (different entropy profiles accept differently): PROMPT="..." python ...
+PROMPT = os.environ.get("PROMPT", "Explain the theory of relativity in simple terms:")
 
 
 def measure(fn, runs=3):
