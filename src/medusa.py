@@ -457,7 +457,7 @@ def medusa_decode_tree(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width
 
 
 def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4, width=2, verbose=False, debug=False, ref_ids=None, return_ids=False,
-                             accept_mode="greedy", temperature=1.0, epsilon=0.3, delta=0.09):
+                             accept_mode="greedy", temperature=1.0, epsilon=0.3, delta=0.09, on_token=None):
     """
     Tree decode with PROPOSE folded into VERIFY: ONE backbone pass per round instead of two.
 
@@ -685,6 +685,14 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
         new_tensor = torch.tensor([committed_this_round], device=device, dtype=torch.long)
         generated = torch.cat([generated, new_tensor], dim=1)
 
+        # STREAM HOOK: emit each committed token with an accept flag for live visualization.
+        # `pending` is the backbone's guaranteed token (the 1 free token/round) -> accepted=False;
+        # best_accepted[:-1] are draft tokens the heads guessed and the backbone confirmed -> True.
+        if on_token is not None:
+            on_token(pending, False)
+            for draft_tok in best_accepted[:-1]:
+                on_token(draft_tok, True)
+
         # DEBUG — compare cumulative output against the greedy reference; on the first token that
         # disagrees, dump this round's full state and stop. Because each round only appends, the
         # first mismatch is always introduced in the round that produced it, so this round's state
@@ -748,6 +756,8 @@ def medusa_decode_tree_fused(medusa, tokenizer, prompt, max_new_tokens=100, K=4,
 
     # the final pending is committed but was held out of `generated` — append it now.
     generated = torch.cat([generated, torch.tensor([[pending]], device=device)], dim=1)
+    if on_token is not None:
+        on_token(pending, False)  # final backbone token
 
     if verbose:
         print(f"  avg new tokens/round: {total_new / rounds:.2f} over {rounds} rounds")

@@ -65,8 +65,12 @@
     <!-- 1. Prompt input -->
     <textarea id="prompt" placeholder="Enter your prompt here..."></textarea>
 
-    <!-- 2. Submit button -->
+    <!-- 2. Mode selector + submit button -->
     <br>
+    <select id="mode">
+        <option value="medusa">Medusa (speculative — colored tokens)</option>
+        <option value="naive">Naive (baseline)</option>
+    </select>
     <button onclick="startGeneration()">Generate</button>
 
     <!-- 3. Token display area -->
@@ -82,10 +86,12 @@
     <script>
         let startTime = null;
         let tokenCount = 0;
+        let acceptedCount = 0;   // draft tokens accepted (blue) — for the acceptance-rate stat
 
         function startGeneration() {
             const prompt = document.getElementById("prompt").value.trim();
             if (!prompt) return;
+            const mode = document.getElementById("mode").value;
 
             // clear previous output and stats
             document.getElementById("output").innerHTML = "";
@@ -93,18 +99,20 @@
             document.getElementById("acceptance").textContent = "—";
             document.getElementById("count").textContent = "0";
             tokenCount = 0;
+            acceptedCount = 0;
             startTime = null;
 
             const ws = new WebSocket("ws://localhost:8000/stream");
 
             ws.onopen = () => {
-                ws.send(JSON.stringify({ prompt: prompt, max_new_tokens: 100 }));
+                ws.send(JSON.stringify({ prompt: prompt, max_new_tokens: 100, mode: mode }));
                 startTime = performance.now();
             };
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 tokenCount++;
+                if (data.accepted === true) acceptedCount++;
 
                 // server sends {text, accepted} per token
                 // accepted=true → #4361ee, accepted=false → #780000, null → white (naive)
@@ -120,6 +128,9 @@
                 const elapsed = (performance.now() - startTime) / 1000;
                 document.getElementById("tps").textContent = (tokenCount / elapsed).toFixed(1);
                 document.getElementById("count").textContent = tokenCount;
+                // acceptance rate = fraction of emitted tokens that were accepted drafts (blue)
+                document.getElementById("acceptance").textContent =
+                    tokenCount > 0 ? (100 * acceptedCount / tokenCount).toFixed(0) + "%" : "—";
             };
 
             ws.onclose = () => {

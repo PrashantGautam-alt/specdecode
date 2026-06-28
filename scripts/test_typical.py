@@ -33,9 +33,15 @@ TEMPERATURE = float(os.environ.get("TEMP", "1.0"))
 PROMPT = os.environ.get("PROMPT", "Explain the theory of relativity in simple terms:")
 
 
-def measure(fn, runs=3):
+def measure(fn, runs=3, seed=None):
+    # seed: re-seed before EACH timed run so typical (sampled) generation follows the
+    # same trajectory every time -> the measured speed matches the verbose run's reported
+    # acceptance. Without this, displayed acceptance and measured speed were different
+    # sampled paths (the benchmark wart noted 2026-06-28).
     times = []
     for _ in range(runs):
+        if seed is not None:
+            torch.manual_seed(seed)
         torch.cuda.synchronize()
         start = time.perf_counter()
         fn()
@@ -71,6 +77,7 @@ if __name__ == "__main__":
         print(f"output: {out!r}")
         medusa_decode_tree_fused(medusa, tokenizer, PROMPT, max_new_tokens=10, K=K, width=WIDTH, accept_mode=mode)  # warmup
         tps = MAX_NEW_TOKENS / measure(
-            lambda m=mode: medusa_decode_tree_fused(medusa, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS, K=K, width=WIDTH, accept_mode=m, temperature=TEMPERATURE)
+            lambda m=mode: medusa_decode_tree_fused(medusa, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS, K=K, width=WIDTH, accept_mode=m, temperature=TEMPERATURE),
+            seed=0,  # match the verbose run's trajectory so acceptance and speed agree
         )
         print(f"speed: {tps:.1f} tok/s  ({tps/naive_tps:.2f}x)\n")
