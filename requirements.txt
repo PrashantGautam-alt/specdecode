@@ -5,4 +5,5 @@ bitsandbytes
 fastapi
 uvicorn
 websockets
+requests
 sentence-transformers
