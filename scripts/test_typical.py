@@ -13,17 +13,21 @@ We can't check typical against greedy token-for-token (it samples), so the check
 This is the 4-head preview. The real test is 6 heads (depth-5 tree) once training finishes.
 """
 
+import os
 import time
 import torch
 from src.models import ModelLoader
 from src.medusa import MedusaModel, medusa_decode_tree_fused
 from src.sampler import naive_generate
 
-CHECKPOINT = "medusa_heads_8b_6head_epoch3.pt"
+CHECKPOINT = "medusa_heads_8b_epoch4.pt"
 MAX_NEW_TOKENS = 100
-K = 6
+K = 4
 WIDTH = 2
-TEMPERATURE = 1.0
+# Temperature is the knob for the typical-acceptance sweep: lower T -> sharper
+# distribution -> only confident tokens clear the threshold -> more coherent but
+# fewer accepts. Read from env so the sweep needs no re-edit: TEMP=0.7 python ...
+TEMPERATURE = float(os.environ.get("TEMP", "1.0"))
 PROMPT = "Explain the theory of relativity in simple terms:"
 
 
@@ -48,7 +52,8 @@ if __name__ == "__main__":
     medusa.heads.load_state_dict(torch.load(CHECKPOINT, map_location="cpu"))
     medusa.heads.to(device="cuda:0", dtype=torch.float16)
     medusa.heads.eval()
-    print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)\n")
+    print(f"Loaded Medusa heads from {CHECKPOINT} (float16, on cuda:0)")
+    print(f"config: K={K} width={WIDTH} TEMPERATURE={TEMPERATURE}\n")
 
     naive_generate(backbone, tokenizer, PROMPT, max_new_tokens=10)  # warmup
     naive_tps = MAX_NEW_TOKENS / measure(lambda: naive_generate(backbone, tokenizer, PROMPT, max_new_tokens=MAX_NEW_TOKENS))
